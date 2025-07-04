@@ -140,10 +140,14 @@ class StackPickingManiSkillEnv(BaseEnv):
         # 选择第一个立方体作为目标
         target_cube = self.cubes[0] if self.cubes else None
         
+        # 获取批量大小
+        batch_size = self.num_envs
+        
         obs = dict(
             tcp_pose=self.agent.tcp.pose.raw_pose,
             goal_pos=self.goal_site.pose.p,
-            success_count=torch.tensor([self.success_count], dtype=torch.float32, device=self.device),
+            # 修复：success_count应该匹配批量大小
+            success_count=torch.full((batch_size,), self.success_count, dtype=torch.float32, device=self.device),
         )
         
         if "state" in self.obs_mode and target_cube is not None:

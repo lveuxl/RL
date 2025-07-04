@@ -22,7 +22,7 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [
-                "--num_envs", "512",
+                "--num_envs", "256",
 
                 // "--enable_render",
                 "--no_render",

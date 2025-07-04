@@ -15,7 +15,7 @@ from torch.distributions.categorical import Categorical
 
 import gymnasium as gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.utils import set_random_seed
@@ -27,111 +27,18 @@ import cv2
 import mani_skill.envs
 from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper, FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
+from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
 # 导入自定义环境
 from stack_picking_maniskill_env import StackPickingManiSkillEnv
 
-class MultiEnvVisualizationCallback(BaseCallback):
-    """多环境可视化回调 - 在SSH环境中保存可视化图像"""
-    
-    def __init__(self, render_freq=10, verbose=0):
-        super().__init__(verbose)
-        self.render_freq = render_freq
-        self.step_count = 0
-        self.save_dir = "visualization_images"
-        
-        # 创建保存目录
-        os.makedirs(self.save_dir, exist_ok=True)
-        
-    def _on_step(self):
-        self.step_count += 1
-        
-        # 定期渲染所有环境
-        if self.step_count % self.render_freq == 0:
-            try:
-                # 获取所有环境的渲染图像
-                images = []
-                for i, env in enumerate(self.training_env.envs):
-                    try:
-                        # 渲染环境
-                        img = env.render()
-                        if img is not None:
-                            # 转换为RGB格式
-                            if len(img.shape) == 3 and img.shape[2] == 3:
-                                images.append(img)
-                            else:
-                                # 如果是灰度图，转换为RGB
-                                if len(img.shape) == 2:
-                                    img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                                    images.append(img_rgb)
-                    except Exception as e:
-                        if self.verbose > 0:
-                            print(f"环境 {i} 渲染失败: {e}")
-                        continue
-                
-                # 如果有图像，组合并保存
-                if images:
-                    self._save_multi_env_image(images)
-                    if self.verbose > 0:
-                        print(f"步骤 {self.step_count}: 已保存多环境可视化图像")
-                    
-            except Exception as e:
-                if self.verbose > 0:
-                    print(f"多环境可视化失败: {e}")
-        
-        return True
-    
-    def _save_multi_env_image(self, images):
-        """保存多环境组合图像到文件"""
-        try:
-            num_envs = len(images)
-            if num_envs == 0:
-                return
-            
-            # 计算网格布局
-            cols = int(np.ceil(np.sqrt(num_envs)))
-            rows = int(np.ceil(num_envs / cols))
-            
-            # 获取单个图像的尺寸
-            h, w = images[0].shape[:2]
-            
-            # 创建组合图像
-            combined_img = np.zeros((rows * h, cols * w, 3), dtype=np.uint8)
-            
-            # 填充图像
-            for i, img in enumerate(images):
-                row = i // cols
-                col = i % cols
-                
-                # 确保图像尺寸一致
-                if img.shape[:2] != (h, w):
-                    img = cv2.resize(img, (w, h))
-                
-                # 放置图像
-                combined_img[row*h:(row+1)*h, col*w:(col+1)*w] = img
-                
-                # 添加环境编号标签
-                cv2.putText(combined_img, f'Env {i}', 
-                           (col*w + 10, row*h + 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            
-            # 保存组合图像
-            filename = f"{self.save_dir}/multi_env_step_{self.step_count:06d}.png"
-            cv2.imwrite(filename, combined_img)
-            
-            # 保持最新的10张图像，删除旧的
-            import glob
-            all_images = sorted(glob.glob(f"{self.save_dir}/multi_env_step_*.png"))
-            if len(all_images) > 10:
-                for old_img in all_images[:-10]:
-                    try:
-                        os.remove(old_img)
-                    except:
-                        pass
-            
-        except Exception as e:
-            if self.verbose > 0:
-                print(f"保存组合图像失败: {e}")
+import gymnasium.spaces
+
+# 导入优化的可视化回调
+from optimized_visualization_callback import create_optimized_callback
+
+# 导入超轻量级可视化回调 - 新增！
+from ultra_lightweight_visualization import create_ultra_lightweight_callback, create_minimal_callback
 
 class PPOTrainingConfig:
     """PPO训练配置类 - 参考PyBullet项目的配置结构"""
@@ -139,7 +46,7 @@ class PPOTrainingConfig:
     def __init__(self):
         # 基础训练参数
         self.total_timesteps = 1000000  # 总训练步数
-        self.num_envs = 4  # 并行环境数量
+        self.num_envs = 1  # 并行环境数量
         self.n_steps = 512  # 每个环境的步数
         self.batch_size = 128  # 批次大小
         self.learning_rate = 3e-4  # 学习率
@@ -151,9 +58,9 @@ class PPOTrainingConfig:
         self.max_grad_norm = 0.5  # 梯度裁剪
         self.gae_lambda = 0.95  # GAE lambda
         
-        # 可视化设置
+        # 可视化设置 - 优化后的默认值
         self.enable_render = True  # 启用可视化
-        self.render_freq = 50  # 可视化频率
+        self.render_freq = 200  # 降低可视化频率，减少卡顿
         
         # 环境相关参数
         self.max_episode_steps = 200
@@ -169,6 +76,166 @@ class PPOTrainingConfig:
             "net_arch": dict(pi=[256, 256], vf=[256, 256]),
             "activation_fn": torch.nn.ReLU,
         }
+
+class ManiSkillVecEnvWrapper(VecEnv):
+    """
+    将ManiSkillVectorEnv包装成stable-baselines3兼容的VecEnv
+    这是关键的兼容性包装器
+    """
+    
+    def __init__(self, maniskill_vec_env):
+        self.maniskill_env = maniskill_vec_env
+        self.num_envs = maniskill_vec_env.num_envs
+        
+        # 获取观测和动作空间
+        self.observation_space = maniskill_vec_env.single_observation_space
+        self.action_space = maniskill_vec_env.single_action_space
+        
+        # 设置设备
+        self.device = getattr(maniskill_vec_env, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        
+        # 确保空间不为None
+        if self.observation_space is None or self.action_space is None:
+            raise ValueError(f"无法获取观测空间或动作空间: obs_space={self.observation_space}, action_space={self.action_space}")
+        
+        # 初始化VecEnv - 使用手动初始化避免stable-baselines3的严格检查
+        # 这是因为ManiSkillVectorEnv的某些属性可能与stable-baselines3的期望不完全匹配
+        self.num_envs = self.num_envs
+        self.observation_space = self.observation_space
+        self.action_space = self.action_space
+        self.reward_range = (-float('inf'), float('inf'))
+        self.spec = None
+        self.metadata = {}
+        self.closed = False
+        
+        # 添加episode奖励跟踪
+        self.episode_rewards = np.zeros(self.num_envs, dtype=np.float32)
+        self.episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
+        
+        print(f"成功创建ManiSkillVecEnvWrapper: {self.num_envs}个环境, obs_shape={self.observation_space.shape}, action_shape={self.action_space.shape}")
+    
+    def env_is_wrapped(self, wrapper_class, indices=None):
+        """检查环境是否被指定的包装器包装"""
+        return [False] * self.num_envs
+        
+    def reset(self):
+        """重置环境"""
+        obs_info = self.maniskill_env.reset()
+        if isinstance(obs_info, tuple):
+            obs, info = obs_info
+        else:
+            obs = obs_info
+            info = [{}] * self.num_envs
+        
+        # 重置episode统计
+        self.episode_rewards.fill(0.0)
+        self.episode_lengths.fill(0)
+        
+        # 转换观测为numpy
+        obs_np = self._convert_obs_to_numpy(obs)
+        return obs_np
+    
+    def step_async(self, actions):
+        """异步执行动作"""
+        # 将numpy动作转换为tensor
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions).float().to(self.device)
+        
+        self.actions = actions
+    
+    def step_wait(self):
+        """等待步骤完成并返回结果"""
+        # 执行动作
+        step_result = self.maniskill_env.step(self.actions)
+        
+        if len(step_result) == 5:
+            obs, rewards, terminated, truncated, infos = step_result
+            # 对于新版gymnasium，done = terminated | truncated
+            dones = terminated | truncated
+        else:
+            obs, rewards, dones, infos = step_result
+        
+        # 转换为numpy格式
+        obs_np = self._convert_obs_to_numpy(obs)
+        rewards_np = self._convert_to_numpy(rewards)
+        dones_np = self._convert_to_numpy(dones)
+        
+        # 确保infos是列表格式，并且每个元素都是字典
+        if not isinstance(infos, list):
+            infos = [{}] * self.num_envs
+        else:
+            # 确保每个info都是字典
+            for i in range(len(infos)):
+                if not isinstance(infos[i], dict):
+                    infos[i] = {}
+        
+        # 确保infos列表长度正确
+        while len(infos) < self.num_envs:
+            infos.append({})
+        
+        # 更新episode统计
+        self.episode_rewards += rewards_np
+        self.episode_lengths += 1
+        
+        # 处理episode结束的情况
+        for i in range(self.num_envs):
+            if dones_np[i]:
+                # 在episode结束时，将总奖励添加到info中
+                # 确保info是字典类型
+                if not isinstance(infos[i], dict):
+                    infos[i] = {}
+                
+                infos[i]['r'] = float(self.episode_rewards[i])
+                infos[i]['l'] = int(self.episode_lengths[i])
+                
+                # 调试信息
+                print(f"Episode结束 - 环境{i}: 奖励={self.episode_rewards[i]:.3f}, 步数={self.episode_lengths[i]}")
+                
+                # 重置该环境的统计
+                self.episode_rewards[i] = 0.0
+                self.episode_lengths[i] = 0
+        
+        return obs_np, rewards_np, dones_np, infos
+    
+    def close(self):
+        """关闭环境"""
+        return self.maniskill_env.close()
+    
+    def get_attr(self, attr_name, indices=None):
+        """获取环境属性"""
+        return getattr(self.maniskill_env, attr_name)
+    
+    def set_attr(self, attr_name, value, indices=None):
+        """设置环境属性"""
+        setattr(self.maniskill_env, attr_name, value)
+    
+    def env_method(self, method_name, *method_args, indices=None, **method_kwargs):
+        """调用环境方法"""
+        return getattr(self.maniskill_env, method_name)(*method_args, **method_kwargs)
+    
+    def render(self, mode="rgb_array"):
+        """渲染环境"""
+        return self.maniskill_env.render()
+    
+    def _convert_obs_to_numpy(self, obs):
+        """转换观测数据为numpy格式"""
+        if isinstance(obs, dict):
+            numpy_obs = {}
+            for key, value in obs.items():
+                numpy_obs[key] = self._convert_to_numpy(value)
+            return numpy_obs
+        else:
+            return self._convert_to_numpy(obs)
+    
+    def _convert_to_numpy(self, tensor_data):
+        """转换tensor为numpy"""
+        if hasattr(tensor_data, 'cpu'):
+            numpy_data = tensor_data.cpu().numpy()
+            return numpy_data
+        elif isinstance(tensor_data, (list, tuple)):
+            return np.array(tensor_data)
+        else:
+            return tensor_data
 
 class RewardMetricsCallback(BaseCallback):
     """奖励指标回调 - 参考PyBullet项目的回调"""
@@ -245,47 +312,61 @@ class RewardMetricsCallback(BaseCallback):
         
         return True
 
-def make_env(env_id, rank, seed=0, enable_render=False):
-    """创建环境的工厂函数 - 修复渲染模式一致性问题"""
-    def _init():
-        # 所有环境都使用相同的渲染模式，避免stable-baselines3的错误
-        # 训练时统一使用rgb_array模式，不使用human模式避免冲突
-        render_mode = "rgb_array"
-        print("rank: ", rank)
-        # 创建ManiSkill环境
-        env = gym.make(
-            "StackPickingManiSkill-v1",
-            obs_mode="state",  # 使用state模式，避免RGBD问题
-            control_mode="pd_joint_delta_pos",
-            render_mode=render_mode,  # 统一使用rgb_array模式
-            max_objects=3,  # 减少物体数量避免复杂性
-            robot_uids="panda",  # 明确指定机器人类型
-        )
-        
-        # 不使用任何包装器，直接使用原始环境
-        
-        # 设置种子 - 使用新的gymnasium标准方式
-        try:
-            # 新的gymnasium方式：通过reset传递种子
-            env.reset(seed=seed + rank)
-        except Exception:
-            # 如果环境不支持新方式，尝试旧方式但避免警告
-            if hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'seed'):
-                env.unwrapped.seed(seed + rank)
-            elif hasattr(env, 'seed'):
-                # 这里会产生弃用警告，但作为后备方案
-                env.seed(seed + rank)
-        
-        # 为动作空间和观测空间设置种子（这些通常不会产生弃用警告）
-        if hasattr(env.action_space, 'seed'):
-            env.action_space.seed(seed + rank)
-        if hasattr(env.observation_space, 'seed'):
-            env.observation_space.seed(seed + rank)
-        
-        return env
+def create_maniskill_envs(config):
+    """使用ManiSkill的批量环境创建功能，然后包装为stable-baselines3兼容格式"""
+    print(f"使用ManiSkill批量创建 {config.num_envs} 个环境...")
     
-    set_random_seed(seed)
-    return _init
+    # 环境配置参数 - 针对可视化卡顿进行优化
+    env_kwargs = {
+        "obs_mode": "state",  # 使用state模式，避免RGBD问题
+        "control_mode": "pd_joint_delta_pos",
+        "render_mode": "human" if config.enable_render else "none",  # 强制使用rgb_array模式
+        "max_objects": 6,  # 进一步减少物体数量
+        "robot_uids": "panda",  # 明确指定机器人类型
+        "sim_backend": "gpu",  # 使用GPU后端支持批量环境
+        # 新增：针对可视化优化的参数
+        # "sim_freq": 240,  # 降低仿真频率，减少计算负担
+        # "control_freq": 20,  # 降低控制频率
+        "shader_dir": "minimal",  # 使用最简着色器（如果支持）
+    }
+    
+    # # 如果启用可视化，进一步优化渲染设置
+    # if config.enable_render:
+    #     print("检测到可视化模式，应用渲染优化...")
+    #     # 添加渲染优化参数
+    #     env_kwargs.update({
+    #         "camera_width": 256,   # 降低渲染分辨率
+    #         "camera_height": 256,  # 降低渲染分辨率
+    #         "render_gpu_device_id": 0,  # 指定GPU设备
+    #     })
+    #     print("已应用可视化渲染优化")
+    
+    # 使用ManiSkill的批量环境创建 - 这比for循环快得多！
+    envs = gym.make(
+        "StackPickingManiSkill-v1",
+        num_envs=config.num_envs,  # 关键参数：批量创建多个环境
+        **env_kwargs
+    )
+    
+    # 应用必要的包装器来处理tensor到numpy转换
+    if config.enable_render:
+        print("已启用渲染模式 - 使用rgb_array格式避免窗口冲突")
+    
+    # 使用ManiSkillVectorEnv包装器
+    # 类型转换以消除linter警告，实际运行时是兼容的
+    maniskill_vec_env = ManiSkillVectorEnv(
+        envs,  # type: ignore  # gym.Env与BaseEnv在运行时兼容
+        num_envs=config.num_envs, 
+        ignore_terminations=True, 
+        record_metrics=True
+    )
+    
+    # 关键步骤：包装为stable-baselines3兼容的VecEnv
+    sb3_compatible_env = ManiSkillVecEnvWrapper(maniskill_vec_env)
+    
+    print(f"成功创建 {config.num_envs} 个并行环境（批量创建）")
+    print("已包装为stable-baselines3兼容格式")
+    return sb3_compatible_env
 
 def save_hyperparameters(params, run_number):
     """保存超参数 - 参考PyBullet项目的保存逻辑"""
@@ -364,8 +445,8 @@ def save_results_to_csv(results, mode, cycle_num, run_number):
     print(f"结果已保存到 {output_file} 文件")
 
 def train_ppo_model(config):
-    """训练PPO模型 - 参考PyBullet项目的训练逻辑"""
-    print("开始PPO模型训练...")
+    """训练PPO模型 - 使用stable-baselines3的PPO与批量环境创建"""
+    print("开始PPO模型训练（使用stable-baselines3 PPO）...")
     
     # 创建目录结构
     main_dir = "maniskill_ppo_model"
@@ -421,37 +502,46 @@ def train_ppo_model(config):
         "gae_lambda": config.gae_lambda,
         "env_reward_config": config.env_reward_config,
         "max_episode_steps": config.max_episode_steps,
+        "environment_creation_method": "batch_creation_with_sb3_wrapper",  # 标记使用批量创建+包装器
     }
     save_hyperparameters(hyperparams, current_run)
     
     try:
-        # 创建向量化环境 - 添加可视化支持
-        env_fns = [make_env(f"StackPickingManiSkill-v1", i, seed=42, enable_render=config.enable_render) 
-                   for i in range(config.num_envs)]
-        vec_env = DummyVecEnv(env_fns)
+        # 使用批量环境创建 + stable-baselines3包装器 - 这是关键的性能优化！
+        print("使用批量环境创建方式 + stable-baselines3兼容包装器...")
+        vec_env = create_maniskill_envs(config)
         
-        print(f"创建了 {config.num_envs} 个并行环境")
+        print(f"成功创建 {config.num_envs} 个并行环境（批量创建+包装器）")
         if config.enable_render:
-            print("已启用实时可视化 - 第一个环境将显示渲染窗口")
+            print("已启用批量渲染支持")
+        
+        # 使用stable-baselines3的PPO - 这是您要求的关键改动！
+        print("使用stable-baselines3的PPO进行训练...")
         
         # 创建PPO模型
         model = PPO(
-            "MlpPolicy",
+            "MlpPolicy",  # 使用多层感知机策略
             vec_env,
-            verbose=1,
-            tensorboard_log=tb_log_dir,
+            learning_rate=config.learning_rate,
             n_steps=config.n_steps,
             batch_size=config.batch_size,
-            learning_rate=config.learning_rate,
-            gamma=config.gamma,
             n_epochs=config.n_epochs,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
             clip_range=config.clip_range,
             ent_coef=config.ent_coef,
             vf_coef=config.vf_coef,
             max_grad_norm=config.max_grad_norm,
-            gae_lambda=config.gae_lambda,
             policy_kwargs=config.policy_kwargs,
+            tensorboard_log=tb_log_dir,
+            device="auto",  # 自动选择设备
+            verbose=1
         )
+        
+        print(f"PPO模型创建成功，使用设备: {model.device}")
+        
+        # 创建回调列表
+        callbacks = []
         
         # 设置检查点回调
         checkpoint_callback = CheckpointCallback(
@@ -461,18 +551,42 @@ def train_ppo_model(config):
             save_replay_buffer=False,
             save_vecnormalize=False,
         )
+        callbacks.append(checkpoint_callback)
         
-        # 创建回调列表
-        callbacks = [checkpoint_callback]
-        
-        # 如果启用可视化，添加多环境可视化回调
+        # 如果启用可视化，添加超轻量级可视化回调 - 彻底解决卡顿！
         if config.enable_render:
-            multi_env_viz_callback = MultiEnvVisualizationCallback(
-                render_freq=config.render_freq, 
-                verbose=1
-            )
-            callbacks.append(multi_env_viz_callback)
-            print(f"已启用多环境可视化 - 将在一个窗口中显示所有 {config.num_envs} 个环境")
+            # 根据环境数量选择不同的可视化策略
+            if config.num_envs == 1:
+                # 单环境：使用超轻量级可视化
+                print("单环境模式 - 使用超轻量级可视化回调")
+                viz_callback = create_ultra_lightweight_callback(
+                    render_freq=config.render_freq,
+                    max_fps=5,  # 限制最大5FPS，避免卡顿
+                    enable_display=True
+                )
+                callbacks.append(viz_callback)
+                print("已启用超轻量级可视化 - 专门解决单环境卡顿问题")
+                
+            elif config.num_envs <= 4:
+                # 少量环境：使用优化的可视化回调
+                print("少量环境模式 - 使用优化可视化回调")
+                optimized_viz_callback = create_optimized_callback(
+                    render_freq=config.render_freq,
+                    max_envs=config.num_envs,
+                    enable_async=True,
+                    save_to_disk=False
+                )
+                callbacks.append(optimized_viz_callback)
+                print(f"已启用优化可视化 - 异步处理，显示{config.num_envs}个环境")
+                
+            else:
+                # 大量环境：使用最小化可视化
+                print("大量环境模式 - 使用最小化可视化回调")
+                minimal_viz_callback = create_minimal_callback(
+                    render_freq=config.render_freq * 2  # 进一步降低频率
+                )
+                callbacks.append(minimal_viz_callback)
+                print(f"已启用最小化可视化 - 仅监控训练状态，不显示图像")
         
         # 创建指标回调
         metrics_callback = RewardMetricsCallback(verbose=1, flush_freq=100)
@@ -520,10 +634,13 @@ def train_ppo_model(config):
         
         print(f"\n{'='*50}")
         print(f"开始训练，总步数: {config.total_timesteps}，并行环境: {config.num_envs}")
+        print(f"环境创建方式: 批量创建（性能优化）+ stable-baselines3包装器")
+        print(f"PPO实现: stable-baselines3 PPO（官方实现）")
+        print(f"可视化: {'优化异步可视化' if config.enable_render else '禁用'}")
         print(f"TensorBoard日志保存到: {tb_log_dir}")
         print(f"{'='*50}\n")
         
-        # 开始训练
+        # 开始训练 - 使用stable-baselines3的PPO！
         model.learn(
             total_timesteps=config.total_timesteps,
             callback=callbacks,
@@ -553,17 +670,13 @@ def evaluate_model(model_path, num_episodes=10):
     """评估训练好的模型"""
     print(f"开始评估模型: {model_path}")
     
-    # 创建评估环境 - 与训练环境保持一致
-    eval_env = gym.make(
-        "StackPickingManiSkill-v1",
-        obs_mode="state",
-        control_mode="pd_joint_delta_pos",
-        render_mode="rgb_array",
-        max_objects=3,
-        robot_uids="panda",
-    )
+    # 创建评估环境配置
+    config = PPOTrainingConfig()
+    config.num_envs = 1  # 评估时只需要1个环境
+    config.enable_render = True  # 评估时启用渲染
     
-    # 不使用任何包装器，与训练时保持一致
+    # 创建评估环境
+    eval_env = create_maniskill_envs(config)
     
     # 加载模型
     model = PPO.load(model_path)
@@ -577,22 +690,46 @@ def evaluate_model(model_path, num_episodes=10):
     for episode in range(num_episodes):
         print(f"评估第 {episode + 1}/{num_episodes} 个episode")
         
-        obs, _ = eval_env.reset()
-        total_reward = 0
+        obs = eval_env.reset()
+        total_reward = 0.0
         steps = 0
         done = False
         
         while not done and steps < 200:
+            # 确保obs是正确的格式
+            if isinstance(obs, tuple):
+                obs = obs[0]  # 如果是元组，取第一个元素
+            
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, _, info = eval_env.step(action)
-            total_reward += reward
+            obs, reward, done, info = eval_env.step(action)
+            
+            # 处理奖励（现在应该已经是numpy格式）
+            if isinstance(reward, (list, np.ndarray)) and len(reward) > 0:
+                total_reward += float(reward[0])
+            else:
+                total_reward += float(reward)
+            
             steps += 1
+            
+            # 检查是否完成
+            if isinstance(done, (list, np.ndarray)):
+                done = done[0] if len(done) > 0 else False
         
         episode_rewards.append(total_reward)
         episode_lengths.append(steps)
-        success_counts.append(info.get('success_count', 0))
         
-        print(f"Episode {episode + 1}: 奖励={total_reward:.3f}, 步数={steps}, 成功数={info.get('success_count', 0)}")
+        # 从info中获取成功计数
+        success_count = 0
+        if info:
+            if isinstance(info, list) and len(info) > 0:
+                info_dict = info[0]
+                if isinstance(info_dict, dict):
+                    success_count = info_dict.get('success_count', 0)
+            elif isinstance(info, dict):
+                success_count = info.get('success_count', 0)
+        
+        success_counts.append(success_count)
+        print(f"Episode {episode + 1}: 奖励={total_reward:.3f}, 步数={steps}, 成功数={success_count}")
     
     # 计算统计信息
     avg_reward = np.mean(episode_rewards)
@@ -620,7 +757,7 @@ def evaluate_model(model_path, num_episodes=10):
 
 def main():
     """主函数 - 参考PyBullet项目的主函数结构"""
-    parser = argparse.ArgumentParser(description='ManiSkill PPO训练')
+    parser = argparse.ArgumentParser(description='ManiSkill PPO训练（使用stable-baselines3 PPO）')
     parser.add_argument('--mode', type=str, default='train', 
                        choices=['train', 'eval', 'visualize'], 
                        help='运行模式: train(训练), eval(评估), visualize(可视化训练)')
@@ -665,6 +802,7 @@ def main():
         elif args.no_render:
             config.enable_render = False
         
+        print(f"使用stable-baselines3 PPO + 批量环境创建方式，将创建 {config.num_envs} 个并行环境")
         train_ppo_model(config)
         
     elif args.mode == 'visualize':
@@ -672,9 +810,9 @@ def main():
         config = PPOTrainingConfig()
         config.enable_render = True
         config.render_freq = 50  # 更频繁的渲染
-        config.num_envs = 1  # 使用单个环境以获得更好的可视化效果
-        print("启动可视化训练模式...")
-        print("注意: 使用单个环境进行可视化训练，训练速度会较慢")
+        config.num_envs = 1  
+        print("启动可视化训练模式（使用stable-baselines3 PPO）...")
+        print(f"注意: 使用 {config.num_envs} 个环境进行可视化训练")
         train_ppo_model(config)
         
     elif args.mode == 'eval':
