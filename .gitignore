@@ -1,0 +1,10 @@
+maniskill_ppo_model/
+maniskill_visual_training/
+maniskill_training_videos/
+log/
+best_chkpts/
+result_videos/
+runs/
+server_visualization/
+visual_training_demo/
+visualization_images/

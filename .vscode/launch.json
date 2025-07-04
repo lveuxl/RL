@@ -1,0 +1,32 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Debugpy Old: Current File",
+            "type": "debugpy-old",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "ppo_maniskill_training.py",
+            "type": "debugpy-old",
+            "request": "launch",
+            "program": "ppo_maniskill_training.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--num_envs", "512",
+
+                // "--enable_render",
+                "--no_render",
+            ]      
+        }
+    ]
+}
