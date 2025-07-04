@@ -199,6 +199,7 @@ class ManiSkillVecEnvWrapper(VecEnv):
     
     def close(self):
         """关闭环境"""
+        print("关闭环境")
         return self.maniskill_env.close()
     
     def get_attr(self, attr_name, indices=None):
