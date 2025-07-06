@@ -325,22 +325,9 @@ def create_maniskill_envs(config):
         "max_objects": 6,  # 进一步减少物体数量
         "robot_uids": "panda",  # 明确指定机器人类型
         "sim_backend": "gpu",  # 使用GPU后端支持批量环境
-        # 新增：针对可视化优化的参数
-        # "sim_freq": 240,  # 降低仿真频率，减少计算负担
-        # "control_freq": 20,  # 降低控制频率
         "shader_dir": "minimal",  # 使用最简着色器（如果支持）
     }
     
-    # # 如果启用可视化，进一步优化渲染设置
-    # if config.enable_render:
-    #     print("检测到可视化模式，应用渲染优化...")
-    #     # 添加渲染优化参数
-    #     env_kwargs.update({
-    #         "camera_width": 256,   # 降低渲染分辨率
-    #         "camera_height": 256,  # 降低渲染分辨率
-    #         "render_gpu_device_id": 0,  # 指定GPU设备
-    #     })
-    #     print("已应用可视化渲染优化")
     
     # 使用ManiSkill的批量环境创建 - 这比for循环快得多！
     envs = gym.make(
