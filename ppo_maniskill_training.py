@@ -343,10 +343,11 @@ def create_maniskill_envs(config):
     # 使用ManiSkillVectorEnv包装器
     # 类型转换以消除linter警告，实际运行时是兼容的
     maniskill_vec_env = ManiSkillVectorEnv(
-        envs,  # type: ignore  # gym.Env与BaseEnv在运行时兼容
+        envs,  # type: ignore
         num_envs=config.num_envs, 
-        ignore_terminations=True, 
-        record_metrics=True
+        ignore_terminations=False,  # 遵循环境终止条件
+        record_metrics=True,        # 保持：记录训练指标
+        auto_reset=True            # 新增：自动重置环境
     )
     
     # 关键步骤：包装为stable-baselines3兼容的VecEnv
