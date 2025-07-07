@@ -113,23 +113,21 @@ class UltraLightweightVisualization(BaseCallback):
     def _get_single_env_image(self) -> Optional[np.ndarray]:
         """获取单个环境的图像（优化版本）"""
         try:
-            if not hasattr(self.training_env, 'render'):
-                return None
+            # 优先使用render_human方法（官方推荐的并行化渲染）
+            if hasattr(self.training_env, 'render_human'):
+                try:
+                    rendered = self.training_env.render_human()
+                    if rendered is not None:
+                        return self._process_rendered_output(rendered)
+                except Exception as e:
+                    if self.verbose > 0:
+                        print(f"render_human失败，回退到render: {e}")
             
-            # 直接调用render，不进行复杂处理
-            rendered = self.training_env.render()
-            
-            if rendered is None:
-                return None
-            
-            # 处理不同的渲染输出格式
-            if isinstance(rendered, np.ndarray):
-                if len(rendered.shape) == 4:  # 批量图像
-                    return rendered[0]  # 只取第一个环境
-                else:  # 单个图像
-                    return rendered
-            elif isinstance(rendered, list) and len(rendered) > 0:
-                return rendered[0]  # 只取第一个环境
+            # 回退到标准render方法
+            if hasattr(self.training_env, 'render'):
+                rendered = self.training_env.render()
+                if rendered is not None:
+                    return self._process_rendered_output(rendered)
             
             return None
             
@@ -137,6 +135,19 @@ class UltraLightweightVisualization(BaseCallback):
             if self.verbose > 0:
                 print(f"获取图像失败: {e}")
             return None
+    
+    def _process_rendered_output(self, rendered) -> Optional[np.ndarray]:
+        """处理渲染输出"""
+        # 处理不同的渲染输出格式
+        if isinstance(rendered, np.ndarray):
+            if len(rendered.shape) == 4:  # 批量图像
+                return rendered[0]  # 只取第一个环境
+            else:  # 单个图像
+                return rendered
+        elif isinstance(rendered, list) and len(rendered) > 0:
+            return rendered[0]  # 只取第一个环境
+        
+        return None
     
     def _fast_display(self, image: np.ndarray):
         """快速显示图像（无额外处理）"""

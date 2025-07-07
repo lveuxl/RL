@@ -1,0 +1,162 @@
+environment:
+  control_mode: pd_joint_delta_pos
+  enable_intelligent_selection: true
+  env_id: EnhancedPickClutterYCB-v1
+  max_episode_steps: 50
+  max_objects: 16
+  object_weights:
+    box:
+      difficulty: 0.25
+      priority: 0.85
+      success_rate: 0.85
+    container:
+      difficulty: 0.3
+      priority: 0.9
+      success_rate: 0.8
+    cylinder:
+      difficulty: 0.4
+      priority: 0.7
+      success_rate: 0.7
+    other:
+      difficulty: 0.6
+      priority: 0.5
+      success_rate: 0.6
+    sphere:
+      difficulty: 0.8
+      priority: 0.4
+      success_rate: 0.5
+    tool:
+      difficulty: 0.5
+      priority: 0.6
+      success_rate: 0.65
+  obs_mode: state
+  reward_mode: dense
+  robot_uids: panda
+  selection_params:
+    category_weight: 0.2
+    exposure_max_distance: 2.0
+    exposure_rays: 64
+    exposure_weight: 0.3
+    failure_decay: 0.9
+    failure_penalty: 0.2
+    grasp_angle_threshold: 30
+    grasp_distance_threshold: 0.1
+    graspability_weight: 0.3
+    max_failure_count: 3
+  sim_backend: gpu
+evaluation:
+  eval_during_training: true
+  eval_env_kwargs:
+    record_video: true
+    render_mode: rgb_array
+  eval_episodes: 10
+  eval_freq: 10000
+  metrics:
+  - success_rate
+  - episode_length
+  - cumulative_reward
+  - grasp_success_rate
+  - stack_height
+  - stability_score
+experiment:
+  description: 复杂堆叠场景的智能物体选择训练
+  name: enhanced_pick_clutter_ycb
+  notes: '这是一个增强版的Pick Clutter YCB环境训练实验，
+
+    主要特点包括：
+
+    1. 智能物体选择算法
+
+    2. 基于暴露度和可抓取性的评分系统
+
+    3. 考虑物体类别和历史失败记录
+
+    4. 复杂堆叠场景支持
+
+    5. 密集奖励函数设计 '
+  seed: 42
+  tags:
+  - pick_and_place
+  - intelligent_selection
+  - stacking
+  - ycb_objects
+  - ppo
+  version: '1.0'
+logging:
+  console_log_freq: 100
+  file_log_freq: 10
+  level: INFO
+  log_dir: logs
+  log_environment_info: true
+  log_hyperparameters: true
+  log_model_info: true
+  log_training_metrics: true
+  metric_log_freq: 1
+  tensorboard_dir: tensorboard
+model:
+  checkpoint_dir: checkpoints
+  checkpoint_freq: 5000
+  model_format: zip
+  save_best_model: true
+  save_checkpoints: true
+  save_dir: models
+  save_last_model: true
+reward:
+  dense_rewards:
+    distance_reward_scale: 0.1
+    distance_reward_weight: 1.0
+    grasp_reward_scale: 0.5
+    grasp_reward_weight: 2.0
+    lift_reward_scale: 1.0
+    lift_reward_weight: 3.0
+    place_reward_scale: 2.0
+    place_reward_weight: 5.0
+    stability_reward_scale: 1.0
+    stability_reward_weight: 2.0
+    stack_reward_scale: 5.0
+    stack_reward_weight: 10.0
+  failure_penalty: -1.0
+  reward_shaping:
+    potential_scale: 0.1
+    use_potential_based: true
+  step_penalty: -0.01
+  success_reward: 10.0
+training:
+  batch_size: 256
+  clip_range: 0.2
+  device: auto
+  ent_coef: 0.01
+  eval_episodes: 10
+  eval_freq: 10000
+  gae_lambda: 0.95
+  gamma: 0.99
+  learning_rate: 3e-4
+  log_freq: 100
+  max_grad_norm: 0.5
+  n_epochs: 10
+  n_steps: 1024
+  num_envs: 8
+  policy_kwargs:
+    activation_fn: ReLU
+    net_arch:
+      pi:
+      - 512
+      - 512
+      - 256
+      vf:
+      - 512
+      - 512
+      - 256
+  save_freq: 5000
+  total_timesteps: 2000000
+  vf_coef: 0.5
+visualization:
+  enable_render: false
+  record_video: false
+  render_freq: 500
+  render_mode: rgb_array
+  show_contact_points: false
+  show_force_arrows: false
+  show_goal: true
+  show_trajectory: false
+  video_freq: 1000

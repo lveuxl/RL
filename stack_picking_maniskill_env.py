@@ -24,7 +24,8 @@ class StackPickingManiSkillEnv(BaseEnv):
     SUPPORTED_ROBOTS = ["panda", "fetch"]
     agent: Union[Panda, Fetch]
     
-    def __init__(self, *args, robot_uids="panda", max_objects=3, **kwargs):
+    def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, max_objects=3, **kwargs):
+        self.robot_init_qpos_noise = robot_init_qpos_noise
         self.max_objects = max_objects
         self.robot_uids = robot_uids
         

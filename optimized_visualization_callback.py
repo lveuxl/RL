@@ -188,21 +188,41 @@ class OptimizedVisualizationCallback(BaseCallback):
         images = []
         
         try:
+            # 优先使用render_human方法（官方推荐的并行化渲染）
+            if hasattr(self.training_env, 'render_human'):
+                try:
+                    rendered = self.training_env.render_human()
+                    if rendered is not None:
+                        images = self._process_rendered_output(rendered)
+                        if images:
+                            return images
+                except Exception as e:
+                    if self.verbose > 0:
+                        print(f"render_human失败，回退到render: {e}")
+            
+            # 回退到标准render方法
             if hasattr(self.training_env, 'render'):
                 rendered = self.training_env.render()
-                
                 if rendered is not None:
-                    if isinstance(rendered, np.ndarray):
-                        if len(rendered.shape) == 4:  # 批量图像
-                            images = [rendered[i] for i in range(rendered.shape[0])]
-                        else:  # 单个图像
-                            images = [rendered]
-                    elif isinstance(rendered, list):
-                        images = rendered
+                    images = self._process_rendered_output(rendered)
                         
         except Exception as e:
             if self.verbose > 0:
                 print(f"获取环境图像失败: {e}")
+        
+        return images
+    
+    def _process_rendered_output(self, rendered) -> List[np.ndarray]:
+        """处理渲染输出"""
+        images = []
+        
+        if isinstance(rendered, np.ndarray):
+            if len(rendered.shape) == 4:  # 批量图像
+                images = [rendered[i] for i in range(rendered.shape[0])]
+            else:  # 单个图像
+                images = [rendered]
+        elif isinstance(rendered, list):
+            images = rendered
         
         return images
     

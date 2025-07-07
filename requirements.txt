@@ -1,43 +1,67 @@
-# ManiSkill环境和仿真依赖
+# 核心依赖
 mani-skill>=3.0.0
-sapien>=3.0.0
-
-# 强化学习算法库
-stable-baselines3>=2.0.0
-gymnasium>=0.29.0
-
-# 深度学习框架
+stable-baselines3>=2.2.0
 torch>=2.0.0
-torchvision>=0.15.0
-
-# 数值计算和数据处理
+gymnasium>=0.29.0
 numpy>=1.21.0
-scipy>=1.7.0
-pandas>=1.3.0
 
-# 图像处理
-opencv-python>=4.5.0
-Pillow>=8.0.0
-imageio>=2.9.0
-imageio-ffmpeg>=0.4.0
+# 机器学习和深度学习
+tensorboard>=2.14.0
+wandb>=0.16.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
 
-# 可视化和日志
-matplotlib>=3.5.0
-seaborn>=0.11.0
-tensorboard>=2.8.0
-wandb>=0.12.0
+# 图像处理和计算机视觉
+opencv-python>=4.8.0
+Pillow>=10.0.0
+imageio>=2.31.0
 
-# 系统工具
-tqdm>=4.62.0
-psutil>=5.8.0
-pyyaml>=6.0
+# 3D处理和可视化
+trimesh>=3.23.0
+open3d>=0.17.0
+
+# 工具和实用程序
+tqdm>=4.66.0
+colorama>=0.4.6
+psutil>=5.9.0
+pyyaml>=6.0.0
+jsonschema>=4.19.0
+
+# 并行处理
+joblib>=1.3.0
+multiprocess>=0.70.0
+
+# 数据存储和序列化
+h5py>=3.9.0
+pickle5>=0.0.12
+cloudpickle>=2.2.0
+
+# 网络和API
+requests>=2.31.0
+urllib3>=2.0.0
 
 # 开发和调试工具
+ipython>=8.15.0
 jupyter>=1.0.0
-ipython>=7.0.0
-pytest>=6.0.0
+ipywidgets>=8.1.0
 
-# 可选：GPU加速 (根据系统选择)
-# torch-audio  # 如果需要音频处理
-# cupy-cuda11x  # 如果使用CUDA 11.x
-# cupy-cuda12x  # 如果使用CUDA 12.x 
+# 可选依赖 (根据需要安装)
+# pybullet>=3.2.5          # 如果需要PyBullet支持
+# gym>=0.26.0              # 如果需要旧版Gym接口
+# ray>=2.7.0               # 如果需要Ray并行化
+# optuna>=3.3.0            # 如果需要超参数优化
+
+# GPU支持 (根据CUDA版本选择)
+# torch>=2.0.0+cu118      # CUDA 11.8
+# torch>=2.0.0+cu121      # CUDA 12.1
+# torchvision>=0.15.0     # 对应的torchvision版本
+
+# 系统依赖 (可能需要系统级安装)
+# libgl1-mesa-glx         # Linux OpenGL支持
+# libglib2.0-0            # Linux系统库
+# libsm6                  # Linux系统库
+# libxext6                # Linux系统库
+# libxrender-dev          # Linux系统库
+# libfontconfig1          # Linux字体支持 

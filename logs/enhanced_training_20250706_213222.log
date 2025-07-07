@@ -1,0 +1,23 @@
+2025-07-06 21:32:22,824 - enhanced_training - INFO - 日志系统初始化完成，日志文件: logs/enhanced_training_20250706_213222.log
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 实验目录: experiments/enhanced_pick_clutter_ycb_20250706_213222
+2025-07-06 21:32:22,829 - enhanced_training - INFO - ============================================================
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 增强版Pick Clutter YCB训练配置摘要
+2025-07-06 21:32:22,829 - enhanced_training - INFO - ============================================================
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 实验名称: enhanced_pick_clutter_ycb
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 实验描述: 复杂堆叠场景的智能物体选择训练
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 版本: 1.0
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 随机种子: 42
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 总训练步数: 2,000,000
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 并行环境数: 8
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 学习率: 3e-4
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 环境ID: EnhancedPickClutterYCB-v1
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 奖励模式: dense
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 最大物体数: 16
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 智能选择: True
+2025-07-06 21:32:22,829 - enhanced_training - INFO - 训练设备: cuda
+2025-07-06 21:32:22,840 - enhanced_training - INFO - GPU数量: 1
+2025-07-06 21:32:22,841 - enhanced_training - INFO - GPU名称: NVIDIA GeForce RTX 3080 Ti
+2025-07-06 21:32:22,841 - enhanced_training - INFO - ============================================================
+2025-07-06 21:32:22,841 - enhanced_training - INFO - 开始测试模式
+2025-07-06 21:32:22,841 - enhanced_training - INFO - 创建测试环境...
+2025-07-06 21:32:22,841 - enhanced_training - ERROR - 运行过程中发生错误: can't set attribute 'reward_mode'

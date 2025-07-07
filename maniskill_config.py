@@ -79,7 +79,7 @@ ENV_CONFIG = {
     # 训练配置
     "training_config": {
         "max_episode_steps": 16,              # 每个episode最大步数
-        "num_envs": 4,                        # 并行环境数量
+        "num_envs": 16,                        # 并行环境数量
         "total_timesteps": 50000,             # 总训练步数
         "eval_episodes": 10,                  # 评估episode数量
     },

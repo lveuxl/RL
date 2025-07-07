@@ -325,13 +325,14 @@ def create_maniskill_envs(config):
         "max_objects": 6,  # 进一步减少物体数量
         "robot_uids": "panda",  # 明确指定机器人类型
         "sim_backend": "gpu",  # 使用GPU后端支持批量环境
-        "shader_dir": "minimal",  # 使用最简着色器（如果支持）
+        "parallel_in_single_scene": "True",
+        "viewer_camera_configs": dict(shader_pack="rt-fast"),
     }
     
     
     # 使用ManiSkill的批量环境创建 - 这比for循环快得多！
     envs = gym.make(
-        "StackPickingManiSkill-v1",
+        "PickClutterYCB-v1",
         num_envs=config.num_envs,  # 关键参数：批量创建多个环境
         **env_kwargs
     )
@@ -758,7 +759,7 @@ def main():
                        help='禁用可视化渲染')
     
     # 添加训练配置参数
-    parser.add_argument('--num_envs', type=int, default=256,
+    parser.add_argument('--num_envs', type=int, default=4,
                        help='并行环境数量')
     parser.add_argument('--total_timesteps', type=int, default=5000000,
                        help='总训练步数')
