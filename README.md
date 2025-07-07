@@ -1,26 +1,26 @@
-# 复杂堆叠杂乱环境 (Complex Stacking Clutter Environment)
+# EnvClutter 环境
 
-基于ManiSkill和Stable Baselines3的复杂堆叠杂乱环境，用于机器人操作的强化学习研究。该环境集成了暴露度计算、智能物体选择和复杂堆叠场景。
+一个基于ManiSkill的复杂堆叠物品抓取环境，支持PPO算法训练和推理。
 
-## 主要特性
+## 环境描述
 
-- **智能物体选择**: 基于物体类别、暴露度和可抓取性的智能选择算法
-- **暴露度计算**: 3D射线投射计算物体的暴露程度
-- **复杂堆叠场景**: 支持多物体堆叠和复杂布局
-- **课程学习**: 渐进式难度提升的训练策略
-- **丰富的可视化**: 训练过程监控和结果分析
-- **完整的评估系统**: 详细的性能分析和报告生成
+EnvClutter是一个机器人抓取环境，任务是在复杂的堆叠场景中抓取指定的物品。环境特点：
 
-## 文件结构
+- **复杂场景**：包含多种YCB物品的随机堆叠
+- **多样化物品**：支持盒子、罐子、瓶子等不同类型的物品
+- **智能奖励**：结合抓取成功、物品位移和时间效率的综合奖励函数
+- **丰富观测**：提供物品类别、尺寸、中心坐标、暴露面积等详细信息
+
+## 项目结构
 
 ```
-├── env_clutter.py          # 环境定义
-├── config.py              # 配置参数
-├── training.py            # 训练脚本
-├── inference.py           # 推理脚本
-├── utils.py               # 工具函数
-├── README.md              # 使用说明
-└── requirements.txt       # 依赖包
+├── env_clutter.py      # 环境实现
+├── training.py         # PPO训练脚本
+├── inference.py        # 推理脚本
+├── config.py          # 配置文件
+├── utils.py           # 工具函数
+├── README.md          # 项目说明
+└── requirements.txt   # 依赖包列表
 ```
 
 ## 安装依赖
@@ -29,273 +29,257 @@
 pip install -r requirements.txt
 ```
 
-### 主要依赖
+主要依赖包：
+- `mani_skill`：机器人仿真环境
+- `torch`：深度学习框架
+- `gymnasium`：强化学习环境接口
+- `numpy`：数值计算
+- `opencv-python`：图像处理
+- `matplotlib`：数据可视化
 
-- `mani_skill`: ManiSkill机器人操作环境
-- `stable-baselines3`: PPO强化学习算法
-- `torch`: PyTorch深度学习框架
-- `gymnasium`: OpenAI Gym环境接口
-- `numpy`: 数值计算
-- `matplotlib`: 数据可视化
-- `wandb`: 实验跟踪和可视化
-
-## 快速开始
+## 使用方法
 
 ### 1. 训练模型
 
+使用PPO算法训练智能体：
+
 ```bash
 # 基础训练
-python training.py
+python training.py --epochs 1000 --steps_per_epoch 2048
 
-# 自定义参数训练
-python training.py --total-timesteps 1000000 --num-envs 8 --learning-rate 3e-4
+# 自定义配置训练
+python training.py --config custom --epochs 2000 --lr_actor 3e-4 --lr_critic 1e-3
 
-# 恢复训练
-python training.py --resume-training --model-path ./models/ppo_model_checkpoint.zip
-
-# 启用课程学习
-python training.py --enable-curriculum --curriculum-stages 3
+# 多GPU训练
+python training.py --device cuda --num_envs 16 --epochs 1000
 ```
 
-### 2. 模型推理
+训练参数说明：
+- `--epochs`：训练轮数
+- `--steps_per_epoch`：每轮步数
+- `--num_envs`：并行环境数量
+- `--lr_actor`：Actor学习率
+- `--lr_critic`：Critic学习率
+- `--config`：配置预设（default/fast/robust）
+- `--log_dir`：日志保存目录
+- `--model_dir`：模型保存目录
+
+### 2. 推理演示
+
+使用训练好的模型进行推理：
 
 ```bash
-# 基础推理
-python inference.py --model-path ./models/ppo_model_final.zip
+# 单次演示
+python inference.py --model_path ./models/ppo_model.pth --mode demo --render
 
-# 详细推理（带可视化）
-python inference.py --model-path ./models/ppo_model_final.zip --render --save-video --verbose
+# 批量评估
+python inference.py --model_path ./models/ppo_model.pth --mode eval --num_episodes 100
 
-# 大规模评估
-python inference.py --model-path ./models/ppo_model_final.zip --n-episodes 100 --deterministic
+# 性能基准测试
+python inference.py --model_path ./models/ppo_model.pth --mode benchmark --num_episodes 50
+
+# 交互式演示
+python inference.py --model_path ./models/ppo_model.pth --mode interactive
 ```
 
-### 3. 配置测试
+推理参数说明：
+- `--model_path`：模型文件路径
+- `--mode`：运行模式（demo/eval/benchmark/interactive）
+- `--num_episodes`：评估episode数量
+- `--record_video`：是否录制视频
+- `--video_dir`：视频保存目录
+- `--render`：是否实时渲染
 
-```bash
-# 测试配置
-python config.py
+### 3. 配置管理
 
-# 测试工具函数
-python utils.py
-```
-
-## 配置说明
-
-### 环境配置
-
-在`config.py`中可以调整以下参数：
+配置文件支持多种预设和自定义：
 
 ```python
-ENV_CONFIG = {
-    "scene_config": {
-        "workspace_bounds": [[-0.3, -0.3, 0.0], [0.3, 0.3, 0.5]],
-        "max_objects": 16,
-        "min_objects": 8,
-        "stacking_probability": 0.3,
-    },
-    "exposure_config": {
-        "ray_directions": 26,  # 射线方向数量
-        "ray_length": 1.0,     # 射线长度
-        "min_clearance": 0.05, # 最小间隙
-    },
-    "reward_config": {
-        "success_reward": 10.0,
-        "failure_penalty": -1.0,
-        "time_penalty": -0.01,
-    }
-}
+from config import get_config, Config
+
+# 使用预设配置
+config = get_config('default')  # 默认配置
+config = get_config('fast')     # 快速训练配置
+config = get_config('robust')   # 鲁棒训练配置
+
+# 自定义配置
+config = Config()
+config.env.num_envs = 8
+config.training.epochs = 2000
+config.model.hidden_dim = 256
+
+# 保存和加载配置
+config.save('my_config.json')
+config = Config.load('my_config.json')
 ```
 
-### 训练配置
+### 4. 工具函数
+
+项目提供了丰富的工具函数：
 
 ```python
-TRAINING_CONFIG = {
-    "total_timesteps": 1000000,
-    "num_envs": 4,
-    "learning_rate": 3e-4,
-    "batch_size": 256,
-    "n_epochs": 10,
-}
+from utils import (
+    setup_seed,           # 设置随机种子
+    VideoRecorder,        # 视频录制
+    RewardTracker,        # 奖励追踪
+    PerformanceProfiler,  # 性能分析
+    evaluate_model,       # 模型评估
+    visualize_training_progress  # 训练可视化
+)
+
+# 设置随机种子
+setup_seed(42)
+
+# 录制视频
+recorder = VideoRecorder('./videos')
+recorder.start_recording()
+# ... 运行环境 ...
+recorder.stop_recording('demo.mp4')
+
+# 追踪奖励
+tracker = RewardTracker()
+tracker.add_episode(reward, success, length)
+stats = tracker.get_stats()
 ```
 
-## 环境详解
+## 环境详细说明
 
-### ComplexStackingClutterEnv
+### 观测空间
 
-主要环境类，继承自ManiSkill的BaseEnv：
+环境提供丰富的观测信息：
 
-- **观察空间**: 包含机器人状态、物体位置、暴露度等信息
-- **动作空间**: 离散动作空间，对应不同的抓取策略
-- **奖励函数**: 基于成功率、效率和智能选择的复合奖励
+- **机器人状态**：关节位置、速度、末端执行器状态
+- **物品信息**：
+  - 类别：盒子、罐子、瓶子等
+  - 尺寸：长、宽、高
+  - 位置：中心坐标(x, y, z)
+  - 暴露面积：可见表面积比例
+- **场景信息**：相机图像、深度信息、分割掩码
 
-### 关键方法
+### 动作空间
 
-```python
-# 计算物体暴露度
-exposure = env.calculate_exposure(object_position, object_size)
+连续动作空间，包括：
+- 末端执行器位置控制(x, y, z)
+- 末端执行器姿态控制(roll, pitch, yaw)
+- 抓取器开合控制
 
-# 智能选择目标物体
-target_object = env.select_optimal_target()
+### 奖励函数
 
-# 评估抓取可行性
-graspability = env.calculate_graspability(object_properties)
-```
+多层次奖励设计：
 
-## 训练策略
+1. **主要奖励**：成功抓取目标物品 (+10.0)
+2. **位移惩罚**：其他物品位移 (-0.1 × 位移距离)
+3. **时间惩罚**：步数惩罚 (-0.01 × 步数)
+4. **接近奖励**：接近目标物品 (+0.1 × 距离减少)
 
-### 课程学习
+### 成功条件
 
-系统支持三阶段课程学习：
-
-1. **简单阶段**: 少量物体，简单布局
-2. **中等阶段**: 中等数量物体，部分堆叠
-3. **困难阶段**: 最大物体数量，复杂堆叠
-
-### 奖励设计
-
-- **成功奖励**: 成功抓取物体获得正奖励
-- **智能选择奖励**: 选择高暴露度物体获得额外奖励
-- **效率奖励**: 减少无效动作的时间惩罚
-- **堆叠奖励**: 成功处理堆叠场景的额外奖励
-
-## 可视化和分析
-
-### 训练监控
-
-使用Weights & Biases进行实时监控：
-
-```python
-# 在training.py中自动启用
-wandb.init(project="complex-stacking-clutter")
-```
-
-### 结果分析
-
-```python
-# 生成训练曲线
-plot_training_curves("./logs/", "./plots/training_curves.png")
-
-# 物体统计分析
-plot_object_statistics(object_data, "./plots/object_stats.png")
-
-# 暴露度热力图
-plot_exposure_heatmap(scene_data, "./plots/exposure_heatmap.png")
-```
+- 成功抓取目标物品
+- 物品离开桌面一定高度
+- 保持抓取状态一定时间
 
 ## 性能优化
 
-### GPU加速
+### 训练优化
 
-```python
-# 在config.py中启用GPU
-ENV_CONFIG["gpu_memory_gb"] = 4.0
-```
+1. **并行环境**：使用多个并行环境加速数据收集
+2. **批处理**：合理设置batch_size平衡内存和性能
+3. **学习率调度**：使用学习率衰减提高训练稳定性
+4. **梯度裁剪**：防止梯度爆炸
 
-### 并行环境
+### 推理优化
 
-```python
-# 增加并行环境数量
-python training.py --num-envs 16
-```
+1. **模型压缩**：使用较小的网络结构进行推理
+2. **批量推理**：同时处理多个观测
+3. **GPU加速**：使用GPU进行推理加速
 
-### 内存优化
+## 实验建议
 
-```python
-# 调整批次大小
-python training.py --batch-size 128
-```
+### 训练策略
 
-## 扩展和自定义
+1. **分阶段训练**：
+   - 第一阶段：简单场景，少量物品
+   - 第二阶段：复杂场景，多种物品
+   - 第三阶段：困难场景，密集堆叠
 
-### 添加新物体类别
+2. **课程学习**：
+   - 逐步增加物品数量
+   - 逐步增加堆叠复杂度
+   - 逐步减少奖励提示
 
-在`config.py`中添加新的物体属性：
+3. **多任务学习**：
+   - 同时训练多种物品类型
+   - 混合不同难度的场景
 
-```python
-OBJECT_PROPERTIES["new_category"] = {
-    "dimensions": [0.05, 0.05, 0.1],
-    "mass": 0.2,
-    "base_success_rate": 0.7,
-    "shape_type": "box",
-    "grasp_difficulty": "medium"
-}
-```
+### 评估指标
 
-### 自定义奖励函数
-
-在`env_clutter.py`中修改`calculate_reward`方法：
-
-```python
-def calculate_reward(self, action, success, info):
-    # 自定义奖励逻辑
-    reward = 0.0
-    if success:
-        reward += self.success_reward
-    # 添加其他奖励组件
-    return reward
-```
-
-### 新的评估指标
-
-在`utils.py`中添加新的分析函数：
-
-```python
-def analyze_custom_metric(results):
-    # 自定义分析逻辑
-    pass
-```
+- **成功率**：完成任务的比例
+- **平均奖励**：每个episode的平均奖励
+- **平均步数**：完成任务的平均步数
+- **位移惩罚**：其他物品的平均位移
+- **收敛速度**：达到目标性能的训练轮数
 
 ## 故障排除
 
 ### 常见问题
 
-1. **CUDA内存不足**: 减少`num_envs`或`batch_size`
-2. **训练不收敛**: 调整学习率或增加训练时间
-3. **环境加载失败**: 检查ManiSkill安装和资源文件
+1. **环境无法创建**：
+   - 检查ManiSkill安装
+   - 确认GPU驱动和CUDA版本
+   - 验证依赖包版本
 
-### 调试模式
+2. **训练不收敛**：
+   - 调整学习率
+   - 增加训练时间
+   - 检查奖励函数设计
 
-```bash
-# 启用详细输出
-python training.py --verbose
+3. **推理性能差**：
+   - 检查模型加载
+   - 验证环境配置一致性
+   - 确认随机种子设置
 
-# 单环境调试
-python training.py --num-envs 1 --render
-```
+4. **内存不足**：
+   - 减少并行环境数量
+   - 降低batch_size
+   - 使用梯度累积
 
-## 实验建议
+### 调试技巧
 
-### 超参数调优
+1. **日志分析**：查看训练日志找出问题
+2. **可视化**：使用渲染和视频录制观察行为
+3. **性能分析**：使用PerformanceProfiler分析瓶颈
+4. **逐步调试**：从简单场景开始逐步增加复杂度
 
-建议的超参数搜索范围：
+## 扩展开发
 
-- 学习率: [1e-4, 3e-4, 1e-3]
-- 批次大小: [64, 128, 256]
-- 环境数量: [4, 8, 16]
+### 添加新物品类型
 
-### 消融研究
+1. 在`env_clutter.py`中添加新的物品定义
+2. 更新`_get_object_size`方法
+3. 修改观测空间维度
 
-测试不同组件的影响：
+### 自定义奖励函数
 
-```bash
-# 禁用智能选择
-python training.py --disable-intelligent-selection
+1. 修改`compute_dense_reward`方法
+2. 添加新的奖励组件
+3. 调整奖励权重
 
-# 不同奖励模式
-python training.py --reward-mode sparse
-```
+### 集成新算法
+
+1. 实现新的智能体类
+2. 修改训练脚本
+3. 更新配置文件
 
 ## 引用
 
-如果您在研究中使用了这个环境，请引用：
+如果您在研究中使用了这个项目，请引用：
 
 ```bibtex
-@misc{complex-stacking-clutter-env,
-  title={Complex Stacking Clutter Environment for Robot Manipulation},
+@misc{envclutter2024,
+  title={EnvClutter: A Complex Stacking Environment for Robotic Manipulation},
   author={Your Name},
   year={2024},
-  howpublished={\url{https://github.com/your-repo}}
+  howpublished={\url{https://github.com/yourusername/envclutter}}
 }
 ```
 
@@ -303,10 +287,9 @@ python training.py --reward-mode sparse
 
 MIT License
 
-## 贡献
-
-欢迎提交Issue和Pull Request来改进这个项目。
-
 ## 联系方式
 
-如有问题请联系：your.email@example.com
+如有问题或建议，请通过以下方式联系：
+- 邮箱：your.email@example.com
+- GitHub Issues：[项目Issues页面]
+- 讨论区：[项目Discussions页面]

@@ -1,391 +1,317 @@
 """
-复杂堆叠杂乱环境推理脚本
-用于加载训练好的模型并进行测试评估
-包含可视化、视频录制、性能分析等功能
+EnvClutter环境推理脚本
+用于加载训练好的模型并进行推理演示
 """
 
 import os
-import time
 import argparse
-from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import torch
 import gymnasium as gym
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from pathlib import Path
+import time
 
-from config import get_inference_config, get_env_config
-from env_clutter import ComplexStackingClutterEnv
+# 导入自定义模块
+from env_clutter import EnvClutterEnv
+from training import PPOAgent, flatten_obs
+from config import Config, get_config
 from utils import (
-    create_directories, save_video_frames, create_evaluation_report,
-    print_evaluation_summary, plot_object_statistics, plot_exposure_heatmap
+    setup_seed, 
+    VideoRecorder, 
+    evaluate_model, 
+    save_evaluation_results,
+    print_evaluation_summary,
+    PerformanceProfiler
 )
 
+import mani_skill.envs
+import warnings
+warnings.filterwarnings("ignore")
 
-class ComplexStackingInference:
-    """复杂堆叠杂乱环境推理器"""
-    
-    def __init__(self, args: argparse.Namespace):
-        self.args = args
-        self.inference_config = get_inference_config()
-        self.env_config = get_env_config()
-        
-        # 创建必要的目录
-        create_directories()
-        
-        # 加载模型
-        self.model = self._load_model()
+class InferenceEngine:
+    """推理引擎"""
+    def __init__(self, model_path: str, config: Config):
+        self.model_path = model_path
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 创建环境
-        self.env = self._create_env()
+        self.env = self._create_environment()
         
-        # 初始化结果存储
-        self.results = {
-            "episodes": [],
-            "total_episodes": 0,
-            "success_count": 0,
-            "total_reward": 0.0,
-            "total_steps": 0,
-            "object_data": [],
-            "scene_data": [],
-        }
+        # 获取状态和动作维度
+        obs, _ = self.env.reset()
+        flattened_obs = flatten_obs(obs)
+        self.state_dim = flattened_obs.shape[0]
+        self.action_dim = self.env.action_space.shape[0]
+        
+        # 创建并加载智能体
+        self.agent = PPOAgent(self.state_dim, self.action_dim)
+        self.agent.load(model_path)
+        
+        print(f"模型已加载: {model_path}")
+        print(f"状态维度: {self.state_dim}, 动作维度: {self.action_dim}")
+        print(f"设备: {self.device}")
     
-    def _load_model(self):
-        """加载训练好的模型"""
-        model_path = self.args.model_path or self.inference_config["model_path"]
-        
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"模型文件不存在: {model_path}")
-        
-        print(f"加载模型: {model_path}")
-        model = PPO.load(model_path)
-        
-        return model
-    
-    def _create_env(self):
-        """创建推理环境"""
-        env = ComplexStackingClutterEnv(
-            max_objects=self.args.max_objects,
-            reward_mode=self.args.reward_mode,
-            enable_intelligent_selection=self.args.enable_intelligent_selection,
-            render_mode="rgb_array" if self.args.render else None,
+    def _create_environment(self):
+        """创建环境"""
+        return gym.make(
+            self.config.env.env_name,
+            num_envs=1,  # 推理时只使用单个环境
+            obs_mode=self.config.env.obs_mode,
+            control_mode=self.config.env.control_mode,
+            reward_mode=self.config.env.reward_mode,
+            render_mode="rgb_array",
         )
-        
-        return env
     
-    def run_episode(self, episode_idx: int, render: bool = False, save_video: bool = False) -> Dict:
+    def run_single_episode(self, render: bool = True, record_video: bool = False, 
+                          video_path: str = None) -> dict:
         """运行单个episode"""
-        obs, info = self.env.reset()
-        done = False
-        episode_reward = 0.0
-        episode_steps = 0
-        frames = []
+        obs, _ = self.env.reset()
+        episode_reward = 0
+        episode_length = 0
+        episode_success = False
         
-        episode_data = {
-            "episode_idx": episode_idx,
-            "steps": [],
-            "total_reward": 0.0,
-            "total_steps": 0,
-            "success": False,
-            "objects_attempted": [],
-            "objects_succeeded": [],
-            "final_scene": None,
-        }
+        # 视频录制
+        video_recorder = None
+        if record_video and video_path:
+            video_dir = Path(video_path).parent
+            video_recorder = VideoRecorder(video_dir)
+            video_recorder.start_recording()
         
-        print(f"\n=== Episode {episode_idx + 1} ===")
+        # 性能分析
+        profiler = PerformanceProfiler()
         
-        while not done:
+        while True:
+            profiler.start_timer("inference")
+            
             # 获取动作
-            action, _states = self.model.predict(
-                obs, 
-                deterministic=self.args.deterministic
-            )
+            flattened_obs = flatten_obs(obs)
+            state = flattened_obs.numpy()
+            action, _ = self.agent.get_action(state)
+            
+            profiler.end_timer("inference")
+            profiler.start_timer("env_step")
             
             # 执行动作
-            obs, reward, done, truncated, info = self.env.step(action)
+            next_obs, reward, terminated, truncated, info = self.env.step(action)
             
-            # 记录数据
+            profiler.end_timer("env_step")
+            
             episode_reward += reward
-            episode_steps += 1
+            episode_length += 1
             
-            # 记录步骤信息
-            step_info = {
-                "step": episode_steps,
-                "action": int(action),
-                "reward": float(reward),
-                "success": info.get("success", False),
-                "remaining_objects": info.get("remaining_objects", 0),
-                "target_category": info.get("target_category", "unknown"),
-                "target_exposure": info.get("target_exposure", 0.0),
-                "target_graspability": info.get("target_graspability", 0.0),
-            }
-            episode_data["steps"].append(step_info)
+            if info.get('success', False):
+                episode_success = True
             
-            # 记录尝试的物体
-            if info.get("target_category"):
-                episode_data["objects_attempted"].append(info["target_category"])
-                if info.get("success"):
-                    episode_data["objects_succeeded"].append(info["target_category"])
-            
-            # 渲染和录制
-            if render or save_video:
+            # 渲染
+            if render or record_video:
                 frame = self.env.render()
-                if frame is not None:
-                    frames.append(frame)
+                if record_video and video_recorder:
+                    video_recorder.add_frame(frame)
             
-            # 打印步骤信息
-            if self.args.verbose:
-                print(f"  步骤 {episode_steps}: 动作={action}, 奖励={reward:.2f}, "
-                      f"成功={'是' if info.get('success') else '否'}, "
-                      f"剩余物体={info.get('remaining_objects', 0)}")
+            obs = next_obs
             
-            # 检查是否结束
-            if done or truncated:
+            if terminated or truncated:
                 break
         
-        # 更新episode数据
-        episode_data["total_reward"] = episode_reward
-        episode_data["total_steps"] = episode_steps
-        episode_data["success"] = info.get("success", False) or len(episode_data["objects_succeeded"]) > 0
-        
-        # 获取最终场景信息
-        if hasattr(self.env, 'current_objects'):
-            episode_data["final_scene"] = {
-                "remaining_objects": len(self.env.current_objects),
-                "objects": [
-                    {
-                        "category": obj["category"],
-                        "position": obj["position"],
-                        "exposure": obj.get("exposure", 0.0),
-                        "graspability": obj.get("graspability", 0.0),
-                    }
-                    for obj in self.env.current_objects
-                ]
-            }
-        
         # 保存视频
-        if save_video and frames:
-            video_path = f"./videos/episode_{episode_idx + 1}.mp4"
-            save_video_frames(frames, video_path, fps=self.args.fps)
+        if record_video and video_recorder:
+            filename = Path(video_path).name if video_path else "inference.mp4"
+            video_recorder.stop_recording(filename)
         
-        # 打印episode总结
-        print(f"Episode {episode_idx + 1} 完成:")
-        print(f"  总奖励: {episode_reward:.2f}")
-        print(f"  总步数: {episode_steps}")
-        print(f"  成功: {'是' if episode_data['success'] else '否'}")
-        print(f"  成功抓取物体数: {len(episode_data['objects_succeeded'])}")
+        # 返回结果
+        results = {
+            'episode_reward': episode_reward,
+            'episode_length': episode_length,
+            'episode_success': episode_success,
+            'performance_stats': profiler.get_stats()
+        }
         
-        return episode_data
+        return results
     
-    def run_evaluation(self) -> Dict:
-        """运行完整评估"""
-        print("=== 开始评估 ===")
-        print(f"总episode数: {self.args.n_episodes}")
-        print(f"确定性推理: {'是' if self.args.deterministic else '否'}")
-        print(f"渲染: {'是' if self.args.render else '否'}")
-        print(f"保存视频: {'是' if self.args.save_video else '否'}")
+    def run_evaluation(self, num_episodes: int = 100, record_videos: bool = False,
+                      video_dir: str = None) -> dict:
+        """运行评估"""
+        print(f"开始评估，共{num_episodes}个episode...")
         
-        start_time = time.time()
+        video_recorder = None
+        if record_videos and video_dir:
+            video_recorder = VideoRecorder(video_dir)
         
-        # 运行多个episodes
-        for episode_idx in range(self.args.n_episodes):
-            episode_data = self.run_episode(
-                episode_idx,
-                render=self.args.render,
-                save_video=self.args.save_video
-            )
-            
-            # 更新总体结果
-            self.results["episodes"].append(episode_data)
-            self.results["total_episodes"] += 1
-            self.results["total_reward"] += episode_data["total_reward"]
-            self.results["total_steps"] += episode_data["total_steps"]
-            
-            if episode_data["success"]:
-                self.results["success_count"] += 1
-            
-            # 收集物体数据
-            if episode_data["final_scene"]:
-                self.results["object_data"].extend(episode_data["final_scene"]["objects"])
-                self.results["scene_data"].append(episode_data["final_scene"])
+        results = evaluate_model(
+            self.env, 
+            self.agent, 
+            num_episodes=num_episodes,
+            render=False,
+            video_recorder=video_recorder
+        )
         
-        evaluation_time = time.time() - start_time
-        
-        # 计算总体统计
-        self.results.update({
-            "evaluation_time": evaluation_time,
-            "success_rate": self.results["success_count"] / self.results["total_episodes"],
-            "average_reward": self.results["total_reward"] / self.results["total_episodes"],
-            "average_steps": self.results["total_steps"] / self.results["total_episodes"],
-        })
-        
-        print(f"\n评估完成，总用时: {evaluation_time:.2f} 秒")
-        
-        return self.results
+        return results
     
-    def analyze_results(self) -> Dict:
-        """分析评估结果"""
-        print("\n=== 分析评估结果 ===")
+    def interactive_demo(self):
+        """交互式演示"""
+        print("=== 交互式演示 ===")
+        print("按 'q' 退出，按 'r' 重置环境，按 's' 开始/暂停")
         
-        # 创建评估报告
-        report = create_evaluation_report(self.results)
+        obs, _ = self.env.reset()
+        paused = False
         
-        # 打印摘要
-        print_evaluation_summary(report)
-        
-        # 生成可视化图表
-        if self.results["object_data"]:
-            # 物体统计图
-            plot_object_statistics(
-                self.results["object_data"],
-                save_path="./plots/inference_object_stats.png"
-            )
+        while True:
+            if not paused:
+                # 获取动作
+                flattened_obs = flatten_obs(obs)
+                state = flattened_obs.numpy()
+                action, _ = self.agent.get_action(state)
+                
+                # 执行动作
+                obs, reward, terminated, truncated, info = self.env.step(action)
+                
+                # 显示信息
+                print(f"\r奖励: {reward:.4f}, 成功: {info.get('success', False)}", end="")
+                
+                if terminated or truncated:
+                    print(f"\nEpisode结束，重置环境...")
+                    obs, _ = self.env.reset()
             
-            # 暴露度热力图
-            if self.results["scene_data"]:
-                plot_exposure_heatmap(
-                    {"objects": self.results["object_data"]},
-                    save_path="./plots/inference_exposure_heatmap.png"
-                )
-        
-        # 分析每个episode的表现
-        self._analyze_episode_performance()
-        
-        # 分析物体类别表现
-        self._analyze_object_category_performance()
-        
-        return report
-    
-    def _analyze_episode_performance(self):
-        """分析每个episode的表现"""
-        print("\n=== Episode表现分析 ===")
-        
-        rewards = [ep["total_reward"] for ep in self.results["episodes"]]
-        steps = [ep["total_steps"] for ep in self.results["episodes"]]
-        successes = [ep["success"] for ep in self.results["episodes"]]
-        
-        print(f"奖励统计:")
-        print(f"  平均值: {np.mean(rewards):.2f}")
-        print(f"  标准差: {np.std(rewards):.2f}")
-        print(f"  最小值: {np.min(rewards):.2f}")
-        print(f"  最大值: {np.max(rewards):.2f}")
-        
-        print(f"\n步数统计:")
-        print(f"  平均值: {np.mean(steps):.1f}")
-        print(f"  标准差: {np.std(steps):.1f}")
-        print(f"  最小值: {np.min(steps)}")
-        print(f"  最大值: {np.max(steps)}")
-        
-        print(f"\n成功率: {np.mean(successes):.2%}")
-    
-    def _analyze_object_category_performance(self):
-        """分析物体类别表现"""
-        print("\n=== 物体类别表现分析 ===")
-        
-        # 统计每个类别的尝试和成功次数
-        category_stats = {}
-        
-        for episode in self.results["episodes"]:
-            for obj_category in episode["objects_attempted"]:
-                if obj_category not in category_stats:
-                    category_stats[obj_category] = {"attempted": 0, "succeeded": 0}
-                category_stats[obj_category]["attempted"] += 1
+            # 渲染
+            self.env.render()
+            time.sleep(0.1)  # 控制帧率
             
-            for obj_category in episode["objects_succeeded"]:
-                if obj_category in category_stats:
-                    category_stats[obj_category]["succeeded"] += 1
-        
-        # 计算成功率
-        print("各类别成功率:")
-        for category, stats in category_stats.items():
-            success_rate = stats["succeeded"] / stats["attempted"] if stats["attempted"] > 0 else 0
-            print(f"  {category}: {success_rate:.2%} ({stats['succeeded']}/{stats['attempted']})")
+            # 检查键盘输入（简化版本）
+            # 实际应用中可能需要更复杂的输入处理
     
-    def save_results(self, save_path: str = "./results/inference_results.json"):
-        """保存推理结果"""
-        from utils import save_training_info
-        save_training_info(self.results, save_path)
-        print(f"推理结果已保存到: {save_path}")
+    def benchmark_performance(self, num_episodes: int = 10):
+        """性能基准测试"""
+        print(f"开始性能基准测试，共{num_episodes}个episode...")
+        
+        total_profiler = PerformanceProfiler()
+        episode_results = []
+        
+        for episode in range(num_episodes):
+            total_profiler.start_timer("total_episode")
+            
+            result = self.run_single_episode(render=False, record_video=False)
+            episode_results.append(result)
+            
+            total_profiler.end_timer("total_episode")
+            
+            print(f"Episode {episode + 1}/{num_episodes}: "
+                  f"奖励={result['episode_reward']:.2f}, "
+                  f"长度={result['episode_length']}, "
+                  f"成功={result['episode_success']}")
+        
+        # 汇总统计
+        total_rewards = [r['episode_reward'] for r in episode_results]
+        total_lengths = [r['episode_length'] for r in episode_results]
+        total_successes = [r['episode_success'] for r in episode_results]
+        
+        print("\n=== 性能基准测试结果 ===")
+        print(f"平均奖励: {np.mean(total_rewards):.4f} ± {np.std(total_rewards):.4f}")
+        print(f"平均长度: {np.mean(total_lengths):.2f} ± {np.std(total_lengths):.2f}")
+        print(f"成功率: {np.mean(total_successes):.4f}")
+        
+        # 性能统计
+        total_profiler.print_stats()
+        
+        return {
+            'mean_reward': np.mean(total_rewards),
+            'std_reward': np.std(total_rewards),
+            'mean_length': np.mean(total_lengths),
+            'success_rate': np.mean(total_successes),
+            'performance_stats': total_profiler.get_stats()
+        }
     
     def close(self):
         """关闭环境"""
         self.env.close()
 
-
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="复杂堆叠杂乱环境推理")
-    
-    # 基本参数
-    parser.add_argument("--model-path", type=str, default=None,
-                        help="模型文件路径")
-    parser.add_argument("--n-episodes", type=int, default=10,
-                        help="评估episode数量")
-    parser.add_argument("--max-steps", type=int, default=16,
-                        help="每个episode最大步数")
-    parser.add_argument("--deterministic", action="store_true",
-                        help="使用确定性推理")
-    
-    # 环境参数
-    parser.add_argument("--max-objects", type=int, default=16,
-                        help="最大物体数量")
-    parser.add_argument("--reward-mode", type=str, default="dense",
-                        choices=["sparse", "dense"],
-                        help="奖励模式")
-    parser.add_argument("--enable-intelligent-selection", action="store_true",
-                        help="启用智能物体选择")
-    
-    # 可视化参数
-    parser.add_argument("--render", action="store_true",
-                        help="渲染环境")
-    parser.add_argument("--save-video", action="store_true",
-                        help="保存视频")
-    parser.add_argument("--fps", type=int, default=30,
-                        help="视频帧率")
-    
-    # 其他参数
-    parser.add_argument("--verbose", action="store_true",
-                        help="详细输出")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="随机种子")
-    
-    return parser.parse_args()
-
-
 def main():
-    """主函数"""
-    args = parse_args()
+    parser = argparse.ArgumentParser(description='EnvClutter环境推理')
+    parser.add_argument('--model_path', type=str, required=True, help='模型文件路径')
+    parser.add_argument('--config', type=str, default='default', help='配置名称或配置文件路径')
+    parser.add_argument('--mode', type=str, default='demo', 
+                       choices=['demo', 'eval', 'benchmark', 'interactive'],
+                       help='运行模式')
+    parser.add_argument('--num_episodes', type=int, default=100, help='评估episode数量')
+    parser.add_argument('--record_video', action='store_true', help='是否录制视频')
+    parser.add_argument('--video_dir', type=str, default='./videos/inference', help='视频保存目录')
+    parser.add_argument('--output_dir', type=str, default='./results', help='结果保存目录')
+    parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser.add_argument('--render', action='store_true', help='是否渲染')
+    
+    args = parser.parse_args()
     
     # 设置随机种子
-    if args.seed is not None:
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+    setup_seed(args.seed)
     
-    # 创建推理器
-    inference = ComplexStackingInference(args)
+    # 加载配置
+    if args.config.endswith('.json'):
+        config = Config.load(args.config)
+    else:
+        config = get_config(args.config)
+    
+    # 创建输出目录
+    os.makedirs(args.output_dir, exist_ok=True)
+    if args.record_video:
+        os.makedirs(args.video_dir, exist_ok=True)
+    
+    # 创建推理引擎
+    inference_engine = InferenceEngine(args.model_path, config)
     
     try:
-        # 运行评估
-        results = inference.run_evaluation()
-        
-        # 分析结果
-        report = inference.analyze_results()
-        
-        # 保存结果
-        inference.save_results()
-        
-        print("\n推理完成！")
-        
+        if args.mode == 'demo':
+            # 演示模式
+            print("=== 演示模式 ===")
+            result = inference_engine.run_single_episode(
+                render=args.render,
+                record_video=args.record_video,
+                video_path=os.path.join(args.video_dir, "demo.mp4") if args.record_video else None
+            )
+            
+            print(f"\n演示结果:")
+            print(f"奖励: {result['episode_reward']:.4f}")
+            print(f"长度: {result['episode_length']}")
+            print(f"成功: {result['episode_success']}")
+            
+        elif args.mode == 'eval':
+            # 评估模式
+            print("=== 评估模式 ===")
+            results = inference_engine.run_evaluation(
+                num_episodes=args.num_episodes,
+                record_videos=args.record_video,
+                video_dir=args.video_dir if args.record_video else None
+            )
+            
+            # 打印结果
+            print_evaluation_summary(results)
+            
+            # 保存结果
+            result_path = os.path.join(args.output_dir, "evaluation_results.json")
+            save_evaluation_results(results, result_path)
+            
+        elif args.mode == 'benchmark':
+            # 基准测试模式
+            print("=== 基准测试模式 ===")
+            results = inference_engine.benchmark_performance(args.num_episodes)
+            
+            # 保存结果
+            result_path = os.path.join(args.output_dir, "benchmark_results.json")
+            with open(result_path, 'w') as f:
+                import json
+                json.dump(results, f, indent=2)
+            print(f"基准测试结果已保存到: {result_path}")
+            
+        elif args.mode == 'interactive':
+            # 交互模式
+            print("=== 交互模式 ===")
+            inference_engine.interactive_demo()
+            
     except KeyboardInterrupt:
-        print("\n推理被用户中断")
+        print("\n用户中断")
     except Exception as e:
-        print(f"\n推理过程中出错: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"运行时错误: {e}")
     finally:
-        # 关闭环境
-        inference.close()
-
+        inference_engine.close()
 
 if __name__ == "__main__":
     main() 

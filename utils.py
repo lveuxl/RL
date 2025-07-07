@@ -1,465 +1,459 @@
 """
-工具函数文件
-包含目录创建、数据保存加载、可视化、评估等功能
+EnvClutter环境的工具函数
+包含可视化、数据处理、评估等辅助功能
 """
 
 import os
-import json
-import pickle
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from typing import Dict, List, Any, Optional, Tuple
-import pandas as pd
-from datetime import datetime
-import cv2
 import torch
+import cv2
+import matplotlib.pyplot as plt
+from typing import Dict, List, Any, Tuple, Optional
+import json
+from collections import defaultdict, deque
+import time
+import gymnasium as gym
 from pathlib import Path
 
+def setup_seed(seed: int = 42):
+    """设置随机种子"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-def create_directories():
-    """创建必要的目录结构"""
-    directories = [
-        "./logs/",
-        "./logs/eval/",
-        "./models/",
-        "./models/checkpoints/",
-        "./videos/",
-        "./plots/",
-        "./data/",
-        "./results/",
-    ]
+def get_device(device: str = "auto") -> torch.device:
+    """获取计算设备"""
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        return torch.device(device)
+
+def flatten_observation(obs: Any) -> np.ndarray:
+    """展平观测数据"""
+    if isinstance(obs, dict):
+        flattened = []
+        for key in sorted(obs.keys()):
+            if key == 'sensor_data':
+                continue  # 跳过图像数据
+            value = obs[key]
+            if isinstance(value, torch.Tensor):
+                flattened.append(value.cpu().numpy().flatten())
+            elif isinstance(value, np.ndarray):
+                flattened.append(value.flatten())
+            elif isinstance(value, (list, tuple)):
+                flattened.append(np.array(value).flatten())
+            else:
+                flattened.append(np.array([value]).flatten())
+        return np.concatenate(flattened)
+    else:
+        return np.array(obs).flatten()
+
+def unflatten_observation(flattened_obs: np.ndarray, obs_structure: Dict) -> Dict:
+    """将展平的观测数据恢复为原始结构"""
+    # 这是一个简化版本，实际实现需要根据具体的观测结构来定制
+    result = {}
+    idx = 0
+    for key, shape in obs_structure.items():
+        if key == 'sensor_data':
+            continue
+        size = np.prod(shape)
+        result[key] = flattened_obs[idx:idx+size].reshape(shape)
+        idx += size
+    return result
+
+class RewardTracker:
+    """奖励跟踪器"""
+    def __init__(self, window_size: int = 100):
+        self.window_size = window_size
+        self.rewards = deque(maxlen=window_size)
+        self.success_rates = deque(maxlen=window_size)
+        self.episode_lengths = deque(maxlen=window_size)
+        self.displacement_penalties = deque(maxlen=window_size)
+        
+    def add_episode(self, reward: float, success: bool, length: int, displacement: float = 0.0):
+        """添加一个episode的数据"""
+        self.rewards.append(reward)
+        self.success_rates.append(float(success))
+        self.episode_lengths.append(length)
+        self.displacement_penalties.append(displacement)
     
-    for directory in directories:
-        Path(directory).mkdir(parents=True, exist_ok=True)
+    def get_stats(self) -> Dict[str, float]:
+        """获取统计信息"""
+        if len(self.rewards) == 0:
+            return {}
+        
+        return {
+            'mean_reward': np.mean(self.rewards),
+            'std_reward': np.std(self.rewards),
+            'success_rate': np.mean(self.success_rates),
+            'mean_episode_length': np.mean(self.episode_lengths),
+            'mean_displacement_penalty': np.mean(self.displacement_penalties),
+            'num_episodes': len(self.rewards)
+        }
+
+class VideoRecorder:
+    """视频录制器"""
+    def __init__(self, save_dir: str, fps: int = 30):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.fps = fps
+        self.frames = []
+        self.recording = False
+        
+    def start_recording(self):
+        """开始录制"""
+        self.frames = []
+        self.recording = True
+        
+    def add_frame(self, frame: np.ndarray):
+        """添加帧"""
+        if self.recording:
+            self.frames.append(frame)
     
-    print("目录结构创建完成")
-
-
-def save_training_info(info: Dict, filepath: str):
-    """保存训练信息到JSON文件"""
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(info, f, indent=2, ensure_ascii=False, default=str)
-        print(f"训练信息已保存到: {filepath}")
-    except Exception as e:
-        print(f"保存训练信息时出错: {e}")
-
-
-def load_training_info(filepath: str) -> Dict:
-    """从JSON文件加载训练信息"""
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            info = json.load(f)
-        print(f"训练信息已从 {filepath} 加载")
-        return info
-    except Exception as e:
-        print(f"加载训练信息时出错: {e}")
-        return {}
-
-
-def save_pickle(data: Any, filepath: str):
-    """保存数据到pickle文件"""
-    try:
-        with open(filepath, 'wb') as f:
-            pickle.dump(data, f)
-        print(f"数据已保存到: {filepath}")
-    except Exception as e:
-        print(f"保存pickle文件时出错: {e}")
-
-
-def load_pickle(filepath: str) -> Any:
-    """从pickle文件加载数据"""
-    try:
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-        print(f"数据已从 {filepath} 加载")
-        return data
-    except Exception as e:
-        print(f"加载pickle文件时出错: {e}")
-        return None
-
-
-def plot_training_curves(log_dir: str, save_path: str = "./plots/training_curves.png"):
-    """绘制训练曲线"""
-    try:
-        # 读取训练日志
-        progress_path = os.path.join(log_dir, "progress.csv")
-        if not os.path.exists(progress_path):
-            print(f"未找到训练日志文件: {progress_path}")
+    def stop_recording(self, filename: str):
+        """停止录制并保存"""
+        if not self.recording or len(self.frames) == 0:
             return
         
-        df = pd.read_csv(progress_path)
+        filepath = self.save_dir / filename
+        height, width = self.frames[0].shape[:2]
         
-        # 创建图表
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle("训练过程曲线", fontsize=16)
-        
-        # 奖励曲线
-        if 'rollout/ep_rew_mean' in df.columns:
-            axes[0, 0].plot(df['time/total_timesteps'], df['rollout/ep_rew_mean'])
-            axes[0, 0].set_title("平均奖励")
-            axes[0, 0].set_xlabel("训练步数")
-            axes[0, 0].set_ylabel("平均奖励")
-            axes[0, 0].grid(True)
-        
-        # episode长度曲线
-        if 'rollout/ep_len_mean' in df.columns:
-            axes[0, 1].plot(df['time/total_timesteps'], df['rollout/ep_len_mean'])
-            axes[0, 1].set_title("平均Episode长度")
-            axes[0, 1].set_xlabel("训练步数")
-            axes[0, 1].set_ylabel("平均长度")
-            axes[0, 1].grid(True)
-        
-        # 损失曲线
-        if 'train/loss' in df.columns:
-            axes[1, 0].plot(df['time/total_timesteps'], df['train/loss'])
-            axes[1, 0].set_title("训练损失")
-            axes[1, 0].set_xlabel("训练步数")
-            axes[1, 0].set_ylabel("损失")
-            axes[1, 0].grid(True)
-        
-        # 学习率曲线
-        if 'train/learning_rate' in df.columns:
-            axes[1, 1].plot(df['time/total_timesteps'], df['train/learning_rate'])
-            axes[1, 1].set_title("学习率")
-            axes[1, 1].set_xlabel("训练步数")
-            axes[1, 1].set_ylabel("学习率")
-            axes[1, 1].grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"训练曲线已保存到: {save_path}")
-        
-    except Exception as e:
-        print(f"绘制训练曲线时出错: {e}")
-
-
-def plot_object_statistics(object_data: List[Dict], save_path: str = "./plots/object_stats.png"):
-    """绘制物体统计信息"""
-    try:
-        # 提取数据
-        categories = [obj['category'] for obj in object_data]
-        exposures = [obj.get('exposure', 0) for obj in object_data]
-        graspabilities = [obj.get('graspability', 0) for obj in object_data]
-        success_rates = [obj.get('success_rate', 0) for obj in object_data]
-        
-        # 创建图表
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle("物体统计信息", fontsize=16)
-        
-        # 暴露度分布
-        axes[0, 0].hist(exposures, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
-        axes[0, 0].set_title("暴露度分布")
-        axes[0, 0].set_xlabel("暴露度")
-        axes[0, 0].set_ylabel("频次")
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # 可抓取性分布
-        axes[0, 1].hist(graspabilities, bins=20, alpha=0.7, color='lightgreen', edgecolor='black')
-        axes[0, 1].set_title("可抓取性分布")
-        axes[0, 1].set_xlabel("可抓取性")
-        axes[0, 1].set_ylabel("频次")
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # 成功率分布
-        axes[1, 0].hist(success_rates, bins=20, alpha=0.7, color='salmon', edgecolor='black')
-        axes[1, 0].set_title("成功率分布")
-        axes[1, 0].set_xlabel("成功率")
-        axes[1, 0].set_ylabel("频次")
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # 类别分布
-        category_counts = pd.Series(categories).value_counts()
-        axes[1, 1].bar(range(len(category_counts)), category_counts.values, color='orange', alpha=0.7)
-        axes[1, 1].set_title("物体类别分布")
-        axes[1, 1].set_xlabel("类别")
-        axes[1, 1].set_ylabel("数量")
-        axes[1, 1].set_xticks(range(len(category_counts)))
-        axes[1, 1].set_xticklabels(category_counts.index, rotation=45, ha='right')
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"物体统计图已保存到: {save_path}")
-        
-    except Exception as e:
-        print(f"绘制物体统计图时出错: {e}")
-
-
-def plot_exposure_heatmap(scene_data: Dict, save_path: str = "./plots/exposure_heatmap.png"):
-    """绘制暴露度热力图"""
-    try:
-        # 提取位置和暴露度数据
-        positions = []
-        exposures = []
-        
-        for obj in scene_data.get('objects', []):
-            pos = obj.get('position', [0, 0, 0])
-            exposure = obj.get('exposure', 0)
-            positions.append([pos[0], pos[1]])
-            exposures.append(exposure)
-        
-        if not positions:
-            print("没有找到位置数据")
-            return
-        
-        positions = np.array(positions)
-        exposures = np.array(exposures)
-        
-        # 创建网格
-        x_min, x_max = positions[:, 0].min() - 0.1, positions[:, 0].max() + 0.1
-        y_min, y_max = positions[:, 1].min() - 0.1, positions[:, 1].max() + 0.1
-        
-        # 创建热力图
-        plt.figure(figsize=(10, 8))
-        scatter = plt.scatter(positions[:, 0], positions[:, 1], 
-                            c=exposures, cmap='viridis', 
-                            s=100, alpha=0.8, edgecolors='black')
-        
-        plt.colorbar(scatter, label='暴露度')
-        plt.title("场景暴露度热力图")
-        plt.xlabel("X坐标")
-        plt.ylabel("Y坐标")
-        plt.grid(True, alpha=0.3)
-        
-        # 添加数值标签
-        for i, (pos, exp) in enumerate(zip(positions, exposures)):
-            plt.annotate(f'{exp:.2f}', (pos[0], pos[1]), 
-                        xytext=(5, 5), textcoords='offset points',
-                        fontsize=8, ha='left')
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"暴露度热力图已保存到: {save_path}")
-        
-    except Exception as e:
-        print(f"绘制暴露度热力图时出错: {e}")
-
-
-def calculate_exposure_metrics(object_data: List[Dict]) -> Dict:
-    """计算暴露度相关指标"""
-    try:
-        exposures = [obj.get('exposure', 0) for obj in object_data]
-        
-        metrics = {
-            'mean_exposure': np.mean(exposures),
-            'std_exposure': np.std(exposures),
-            'min_exposure': np.min(exposures),
-            'max_exposure': np.max(exposures),
-            'median_exposure': np.median(exposures),
-            'q25_exposure': np.percentile(exposures, 25),
-            'q75_exposure': np.percentile(exposures, 75),
-        }
-        
-        return metrics
-        
-    except Exception as e:
-        print(f"计算暴露度指标时出错: {e}")
-        return {}
-
-
-def calculate_graspability_metrics(object_data: List[Dict]) -> Dict:
-    """计算可抓取性相关指标"""
-    try:
-        graspabilities = [obj.get('graspability', 0) for obj in object_data]
-        
-        metrics = {
-            'mean_graspability': np.mean(graspabilities),
-            'std_graspability': np.std(graspabilities),
-            'min_graspability': np.min(graspabilities),
-            'max_graspability': np.max(graspabilities),
-            'median_graspability': np.median(graspabilities),
-            'q25_graspability': np.percentile(graspabilities, 25),
-            'q75_graspability': np.percentile(graspabilities, 75),
-        }
-        
-        return metrics
-        
-    except Exception as e:
-        print(f"计算可抓取性指标时出错: {e}")
-        return {}
-
-
-def save_video_frames(frames: List[np.ndarray], output_path: str, fps: int = 30):
-    """保存视频帧为MP4文件"""
-    try:
-        if not frames:
-            print("没有帧数据")
-            return
-        
-        height, width = frames[0].shape[:2]
+        # 使用OpenCV保存视频
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        out = cv2.VideoWriter(str(filepath), fourcc, self.fps, (width, height))
         
-        for frame in frames:
-            # 确保帧是正确的格式
+        for frame in self.frames:
             if len(frame.shape) == 3:
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             out.write(frame)
         
         out.release()
-        print(f"视频已保存到: {output_path}")
+        self.recording = False
+        print(f"视频已保存到: {filepath}")
+
+class PerformanceProfiler:
+    """性能分析器"""
+    def __init__(self):
+        self.timers = defaultdict(list)
+        self.start_times = {}
         
-    except Exception as e:
-        print(f"保存视频时出错: {e}")
-
-
-def create_evaluation_report(results: Dict, save_path: str = "./results/evaluation_report.json"):
-    """创建评估报告"""
-    try:
-        report = {
-            "timestamp": datetime.now().isoformat(),
-            "summary": {
-                "total_episodes": results.get("total_episodes", 0),
-                "success_rate": results.get("success_rate", 0.0),
-                "average_reward": results.get("average_reward", 0.0),
-                "average_steps": results.get("average_steps", 0.0),
-            },
-            "detailed_results": results,
-            "metrics": {
-                "exposure_metrics": calculate_exposure_metrics(results.get("object_data", [])),
-                "graspability_metrics": calculate_graspability_metrics(results.get("object_data", [])),
+    def start_timer(self, name: str):
+        """开始计时"""
+        self.start_times[name] = time.time()
+    
+    def end_timer(self, name: str):
+        """结束计时"""
+        if name in self.start_times:
+            elapsed = time.time() - self.start_times[name]
+            self.timers[name].append(elapsed)
+            del self.start_times[name]
+    
+    def get_stats(self) -> Dict[str, Dict[str, float]]:
+        """获取性能统计"""
+        stats = {}
+        for name, times in self.timers.items():
+            stats[name] = {
+                'mean': np.mean(times),
+                'std': np.std(times),
+                'min': np.min(times),
+                'max': np.max(times),
+                'total': np.sum(times),
+                'count': len(times)
             }
-        }
-        
-        save_training_info(report, save_path)
-        print(f"评估报告已保存到: {save_path}")
-        
-        return report
-        
-    except Exception as e:
-        print(f"创建评估报告时出错: {e}")
-        return {}
+        return stats
+    
+    def print_stats(self):
+        """打印性能统计"""
+        stats = self.get_stats()
+        print("\n=== 性能统计 ===")
+        for name, stat in stats.items():
+            print(f"{name}:")
+            print(f"  平均: {stat['mean']:.4f}s")
+            print(f"  标准差: {stat['std']:.4f}s")
+            print(f"  最小: {stat['min']:.4f}s")
+            print(f"  最大: {stat['max']:.4f}s")
+            print(f"  总计: {stat['total']:.4f}s")
+            print(f"  次数: {stat['count']}")
 
-
-def print_evaluation_summary(report: Dict):
-    """打印评估摘要"""
+def visualize_training_progress(log_dir: str, save_path: str = None):
+    """可视化训练进度"""
     try:
-        print("\n" + "="*50)
-        print("           评估结果摘要")
-        print("="*50)
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
         
-        summary = report.get("summary", {})
-        print(f"总episode数: {summary.get('total_episodes', 0)}")
-        print(f"成功率: {summary.get('success_rate', 0.0):.2%}")
-        print(f"平均奖励: {summary.get('average_reward', 0.0):.2f}")
-        print(f"平均步数: {summary.get('average_steps', 0.0):.1f}")
+        # 读取tensorboard日志
+        ea = EventAccumulator(log_dir)
+        ea.Reload()
         
-        # 暴露度指标
-        exposure_metrics = report.get("metrics", {}).get("exposure_metrics", {})
-        if exposure_metrics:
-            print(f"\n暴露度指标:")
-            print(f"  平均值: {exposure_metrics.get('mean_exposure', 0.0):.3f}")
-            print(f"  标准差: {exposure_metrics.get('std_exposure', 0.0):.3f}")
-            print(f"  最小值: {exposure_metrics.get('min_exposure', 0.0):.3f}")
-            print(f"  最大值: {exposure_metrics.get('max_exposure', 0.0):.3f}")
+        # 获取标量数据
+        scalar_keys = ea.Tags()['scalars']
         
-        # 可抓取性指标
-        graspability_metrics = report.get("metrics", {}).get("graspability_metrics", {})
-        if graspability_metrics:
-            print(f"\n可抓取性指标:")
-            print(f"  平均值: {graspability_metrics.get('mean_graspability', 0.0):.3f}")
-            print(f"  标准差: {graspability_metrics.get('std_graspability', 0.0):.3f}")
-            print(f"  最小值: {graspability_metrics.get('min_graspability', 0.0):.3f}")
-            print(f"  最大值: {graspability_metrics.get('max_graspability', 0.0):.3f}")
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle('训练进度', fontsize=16)
         
-        print("="*50)
+        # 绘制奖励曲线
+        if 'Training/Episode_Reward' in scalar_keys:
+            rewards = ea.Scalars('Training/Episode_Reward')
+            steps = [r.step for r in rewards]
+            values = [r.value for r in rewards]
+            axes[0, 0].plot(steps, values)
+            axes[0, 0].set_title('Episode Reward')
+            axes[0, 0].set_xlabel('Epoch')
+            axes[0, 0].set_ylabel('Reward')
+            axes[0, 0].grid(True)
         
-    except Exception as e:
-        print(f"打印评估摘要时出错: {e}")
-
-
-def log_experiment_config(config: Dict, save_path: str = "./logs/experiment_config.json"):
-    """记录实验配置"""
-    try:
-        config_with_timestamp = {
-            "timestamp": datetime.now().isoformat(),
-            "config": config
-        }
+        # 绘制成功率曲线
+        if 'Training/Success_Rate' in scalar_keys:
+            success_rates = ea.Scalars('Training/Success_Rate')
+            steps = [s.step for s in success_rates]
+            values = [s.value for s in success_rates]
+            axes[0, 1].plot(steps, values)
+            axes[0, 1].set_title('Success Rate')
+            axes[0, 1].set_xlabel('Epoch')
+            axes[0, 1].set_ylabel('Success Rate')
+            axes[0, 1].grid(True)
         
-        save_training_info(config_with_timestamp, save_path)
-        print(f"实验配置已保存到: {save_path}")
+        # 绘制Actor损失
+        if 'Training/Actor_Loss' in scalar_keys:
+            actor_losses = ea.Scalars('Training/Actor_Loss')
+            steps = [a.step for a in actor_losses]
+            values = [a.value for a in actor_losses]
+            axes[1, 0].plot(steps, values)
+            axes[1, 0].set_title('Actor Loss')
+            axes[1, 0].set_xlabel('Epoch')
+            axes[1, 0].set_ylabel('Loss')
+            axes[1, 0].grid(True)
         
-    except Exception as e:
-        print(f"记录实验配置时出错: {e}")
-
-
-def compare_models(model_results: Dict[str, Dict], save_path: str = "./plots/model_comparison.png"):
-    """比较不同模型的性能"""
-    try:
-        model_names = list(model_results.keys())
-        success_rates = [results.get("success_rate", 0) for results in model_results.values()]
-        avg_rewards = [results.get("average_reward", 0) for results in model_results.values()]
-        avg_steps = [results.get("average_steps", 0) for results in model_results.values()]
-        
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        fig.suptitle("模型性能比较", fontsize=16)
-        
-        # 成功率比较
-        axes[0].bar(model_names, success_rates, color='skyblue', alpha=0.7)
-        axes[0].set_title("成功率比较")
-        axes[0].set_ylabel("成功率")
-        axes[0].set_ylim(0, 1)
-        for i, v in enumerate(success_rates):
-            axes[0].text(i, v + 0.01, f'{v:.2%}', ha='center', va='bottom')
-        
-        # 平均奖励比较
-        axes[1].bar(model_names, avg_rewards, color='lightgreen', alpha=0.7)
-        axes[1].set_title("平均奖励比较")
-        axes[1].set_ylabel("平均奖励")
-        for i, v in enumerate(avg_rewards):
-            axes[1].text(i, v + max(avg_rewards) * 0.01, f'{v:.2f}', ha='center', va='bottom')
-        
-        # 平均步数比较
-        axes[2].bar(model_names, avg_steps, color='salmon', alpha=0.7)
-        axes[2].set_title("平均步数比较")
-        axes[2].set_ylabel("平均步数")
-        for i, v in enumerate(avg_steps):
-            axes[2].text(i, v + max(avg_steps) * 0.01, f'{v:.1f}', ha='center', va='bottom')
+        # 绘制Critic损失
+        if 'Training/Critic_Loss' in scalar_keys:
+            critic_losses = ea.Scalars('Training/Critic_Loss')
+            steps = [c.step for c in critic_losses]
+            values = [c.value for c in critic_losses]
+            axes[1, 1].plot(steps, values)
+            axes[1, 1].set_title('Critic Loss')
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].set_ylabel('Loss')
+            axes[1, 1].grid(True)
         
         plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
         
-        print(f"模型比较图已保存到: {save_path}")
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"训练进度图已保存到: {save_path}")
         
+        plt.show()
+        
+    except ImportError:
+        print("需要安装tensorboard来可视化训练进度")
     except Exception as e:
-        print(f"比较模型时出错: {e}")
+        print(f"可视化训练进度时出错: {e}")
 
-
-def set_matplotlib_chinese():
-    """设置matplotlib支持中文"""
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
-    plt.rcParams['axes.unicode_minus'] = False
-
-
-# 初始化matplotlib中文支持
-set_matplotlib_chinese()
-
-
-if __name__ == "__main__":
-    # 工具函数测试
-    print("=== 工具函数测试 ===")
+def evaluate_model(env, agent, num_episodes: int = 100, render: bool = False, 
+                  video_recorder: Optional[VideoRecorder] = None) -> Dict[str, Any]:
+    """评估模型性能"""
+    episode_rewards = []
+    episode_lengths = []
+    success_count = 0
+    displacement_penalties = []
     
-    # 创建目录
-    create_directories()
+    for episode in range(num_episodes):
+        obs, _ = env.reset()
+        episode_reward = 0
+        episode_length = 0
+        episode_success = False
+        episode_displacement = 0
+        
+        if video_recorder and episode < 5:  # 只录制前5个episode
+            video_recorder.start_recording()
+        
+        while True:
+            # 获取动作
+            flattened_obs = flatten_observation(obs)
+            action, _ = agent.get_action(flattened_obs)
+            
+            # 执行动作
+            obs, reward, terminated, truncated, info = env.step(action)
+            
+            episode_reward += reward
+            episode_length += 1
+            
+            if info.get('success', False):
+                episode_success = True
+            
+            # 记录位移惩罚
+            if hasattr(env, '_calculate_other_objects_displacement'):
+                displacement = env._calculate_other_objects_displacement()
+                episode_displacement += displacement.item() if hasattr(displacement, 'item') else displacement
+            
+            if render:
+                env.render()
+            
+            if video_recorder and episode < 5:
+                frame = env.render()
+                if frame is not None:
+                    video_recorder.add_frame(frame)
+            
+            if terminated or truncated:
+                break
+        
+        if video_recorder and episode < 5:
+            video_recorder.stop_recording(f"eval_episode_{episode}.mp4")
+        
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
+        displacement_penalties.append(episode_displacement)
+        
+        if episode_success:
+            success_count += 1
     
-    # 测试数据保存和加载
-    test_data = {
-        "test_key": "test_value",
-        "numbers": [1, 2, 3, 4, 5],
-        "timestamp": datetime.now().isoformat()
+    # 计算统计信息
+    results = {
+        'mean_reward': np.mean(episode_rewards),
+        'std_reward': np.std(episode_rewards),
+        'success_rate': success_count / num_episodes,
+        'mean_episode_length': np.mean(episode_lengths),
+        'std_episode_length': np.std(episode_lengths),
+        'mean_displacement_penalty': np.mean(displacement_penalties),
+        'episode_rewards': episode_rewards,
+        'episode_lengths': episode_lengths,
+        'displacement_penalties': displacement_penalties,
     }
     
-    save_training_info(test_data, "./logs/test_info.json")
-    loaded_data = load_training_info("./logs/test_info.json")
-    print(f"加载的数据: {loaded_data}")
+    return results
+
+def save_evaluation_results(results: Dict[str, Any], filepath: str):
+    """保存评估结果"""
+    # 转换numpy数组为列表以便JSON序列化
+    serializable_results = {}
+    for key, value in results.items():
+        if isinstance(value, np.ndarray):
+            serializable_results[key] = value.tolist()
+        elif isinstance(value, (np.integer, np.floating)):
+            serializable_results[key] = value.item()
+        else:
+            serializable_results[key] = value
     
-    print("工具函数测试完成") 
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(serializable_results, f, indent=2, ensure_ascii=False)
+    
+    print(f"评估结果已保存到: {filepath}")
+
+def load_evaluation_results(filepath: str) -> Dict[str, Any]:
+    """加载评估结果"""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        results = json.load(f)
+    return results
+
+def print_evaluation_summary(results: Dict[str, Any]):
+    """打印评估摘要"""
+    print("\n=== 评估结果摘要 ===")
+    print(f"平均奖励: {results['mean_reward']:.4f} ± {results['std_reward']:.4f}")
+    print(f"成功率: {results['success_rate']:.4f}")
+    print(f"平均episode长度: {results['mean_episode_length']:.2f} ± {results['std_episode_length']:.2f}")
+    print(f"平均位移惩罚: {results['mean_displacement_penalty']:.4f}")
+
+def create_comparison_plot(results_list: List[Dict[str, Any]], 
+                          labels: List[str], 
+                          save_path: str = None):
+    """创建多个模型的比较图"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle('模型性能比较', fontsize=16)
+    
+    # 准备数据
+    mean_rewards = [r['mean_reward'] for r in results_list]
+    std_rewards = [r['std_reward'] for r in results_list]
+    success_rates = [r['success_rate'] for r in results_list]
+    mean_lengths = [r['mean_episode_length'] for r in results_list]
+    mean_displacements = [r['mean_displacement_penalty'] for r in results_list]
+    
+    x = np.arange(len(labels))
+    
+    # 平均奖励
+    axes[0, 0].bar(x, mean_rewards, yerr=std_rewards, capsize=5)
+    axes[0, 0].set_title('平均奖励')
+    axes[0, 0].set_xticks(x)
+    axes[0, 0].set_xticklabels(labels, rotation=45)
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 成功率
+    axes[0, 1].bar(x, success_rates)
+    axes[0, 1].set_title('成功率')
+    axes[0, 1].set_xticks(x)
+    axes[0, 1].set_xticklabels(labels, rotation=45)
+    axes[0, 1].set_ylim(0, 1)
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # 平均episode长度
+    axes[1, 0].bar(x, mean_lengths)
+    axes[1, 0].set_title('平均Episode长度')
+    axes[1, 0].set_xticks(x)
+    axes[1, 0].set_xticklabels(labels, rotation=45)
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 平均位移惩罚
+    axes[1, 1].bar(x, mean_displacements)
+    axes[1, 1].set_title('平均位移惩罚')
+    axes[1, 1].set_xticks(x)
+    axes[1, 1].set_xticklabels(labels, rotation=45)
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"比较图已保存到: {save_path}")
+    
+    plt.show()
+
+def check_environment_setup():
+    """检查环境设置"""
+    print("=== 环境设置检查 ===")
+    
+    # 检查PyTorch
+    print(f"PyTorch版本: {torch.__version__}")
+    print(f"CUDA可用: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA版本: {torch.version.cuda}")
+        print(f"GPU数量: {torch.cuda.device_count()}")
+        print(f"当前GPU: {torch.cuda.current_device()}")
+    
+    # 检查ManiSkill
+    try:
+        import mani_skill
+        print(f"ManiSkill版本: {mani_skill.__version__}")
+    except ImportError:
+        print("ManiSkill未安装")
+    
+    # 检查其他依赖
+    dependencies = ['numpy', 'cv2', 'matplotlib', 'gymnasium']
+    for dep in dependencies:
+        try:
+            module = __import__(dep)
+            if hasattr(module, '__version__'):
+                print(f"{dep}版本: {module.__version__}")
+            else:
+                print(f"{dep}: 已安装")
+        except ImportError:
+            print(f"{dep}: 未安装")
+
+if __name__ == "__main__":
+    # 测试工具函数
+    check_environment_setup()
+    
+    # 创建示例数据
+    tracker = RewardTracker()
+    for i in range(10):
+        tracker.add_episode(
+            reward=np.random.normal(5, 2),
+            success=np.random.choice([True, False]),
+            length=np.random.randint(50, 200),
+            displacement=np.random.uniform(0, 1)
+        )
+    
+    stats = tracker.get_stats()
+    print("\n=== 奖励跟踪器测试 ===")
+    for key, value in stats.items():
+        print(f"{key}: {value:.4f}")
+    
+    print("\n工具函数测试完成！") 

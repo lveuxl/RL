@@ -1,0 +1,448 @@
+{
+  "run_number": 1,
+  "timestamp": "2025-07-07T11:44:45.996693",
+  "config": {
+    "env": {
+      "max_objects": 16,
+      "max_episode_steps": 200,
+      "observation_mode": "state",
+      "control_mode": "pd_ee_delta_pose",
+      "render_mode": "rgb_array",
+      "scene_config": {
+        "workspace_bounds": {
+          "x_min": 0.3,
+          "x_max": 1.2,
+          "y_min": -0.5,
+          "y_max": 0.5,
+          "z_min": 0.8,
+          "z_max": 1.5
+        },
+        "table_height": 0.8,
+        "use_table": true,
+        "lighting": "default"
+      },
+      "object_generation": {
+        "min_objects": 8,
+        "max_objects": 16,
+        "stacking_probability": 0.7,
+        "max_stack_height": 3,
+        "cluster_probability": 0.5,
+        "spawn_area_radius": 0.15,
+        "spawn_center": [
+          0.8,
+          0.0
+        ]
+      },
+      "robot_config": {
+        "robot_type": "panda",
+        "initial_position": [
+          -0.615,
+          0,
+          0
+        ],
+        "initial_qpos_noise": 0.02,
+        "control_frequency": 20
+      },
+      "camera_config": {
+        "width": 128,
+        "height": 128,
+        "fov": 90,
+        "near": 0.01,
+        "far": 100,
+        "position": [
+          0.3,
+          0,
+          0.6
+        ],
+        "target": [
+          -0.1,
+          0,
+          0.1
+        ]
+      },
+      "observation_config": {
+        "object_features_dim": 12,
+        "global_features_dim": 3,
+        "max_objects": 16,
+        "include_rgb": true,
+        "include_depth": false,
+        "include_state": true,
+        "normalize_features": true
+      },
+      "action_config": {
+        "action_type": "discrete",
+        "num_actions": 16,
+        "action_description": "选择要抓取的物体ID"
+      }
+    },
+    "reward": {
+      "success_reward": 10.0,
+      "failure_penalty": -2.0,
+      "time_penalty": -0.1,
+      "exposure_bonus": 2.0,
+      "category_bonus_max": 0.5,
+      "distance_bonus": 1.0,
+      "height_bonus": 1.5,
+      "collision_penalty": -1.0,
+      "invalid_action_penalty": -0.5,
+      "repeated_failure_penalty": -0.2,
+      "weights": {
+        "success": 1.0,
+        "exposure": 0.3,
+        "category": 0.2,
+        "efficiency": 0.1
+      }
+    },
+    "ppo": {
+      "policy": "MlpPolicy",
+      "learning_rate": 0.0003,
+      "n_steps": 2048,
+      "batch_size": 128,
+      "n_epochs": 10,
+      "gamma": 0.99,
+      "gae_lambda": 0.95,
+      "clip_range": 0.2,
+      "clip_range_vf": null,
+      "normalize_advantage": true,
+      "ent_coef": 0.01,
+      "vf_coef": 0.5,
+      "max_grad_norm": 0.5,
+      "target_kl": null,
+      "policy_kwargs": {
+        "net_arch": [
+          {
+            "pi": [
+              256,
+              256
+            ],
+            "vf": [
+              256,
+              256
+            ]
+          }
+        ],
+        "activation_fn": "tanh",
+        "ortho_init": true,
+        "log_std_init": 0.0,
+        "full_std": true,
+        "use_expln": false,
+        "squash_output": false
+      },
+      "total_timesteps": 1000000,
+      "eval_freq": 10000,
+      "eval_episodes": 10,
+      "save_freq": 20000,
+      "log_interval": 100,
+      "device": "auto",
+      "verbose": 1,
+      "num_envs": 8,
+      "env_wrapper": null,
+      "seed": 42
+    },
+    "object_properties": {
+      "can": {
+        "base_success_rate": 0.8,
+        "typical_dimensions": [
+          0.05,
+          0.05,
+          0.1
+        ],
+        "mass_range": [
+          0.1,
+          0.5
+        ],
+        "graspability_modifier": 0.1,
+        "color_range": [
+          [
+            0.7,
+            0.7,
+            0.7
+          ],
+          [
+            0.9,
+            0.9,
+            0.9
+          ]
+        ]
+      },
+      "box": {
+        "base_success_rate": 0.7,
+        "typical_dimensions": [
+          0.1,
+          0.15,
+          0.05
+        ],
+        "mass_range": [
+          0.05,
+          0.3
+        ],
+        "graspability_modifier": 0.05,
+        "color_range": [
+          [
+            0.8,
+            0.6,
+            0.4
+          ],
+          [
+            1.0,
+            0.8,
+            0.6
+          ]
+        ]
+      },
+      "bottle": {
+        "base_success_rate": 0.6,
+        "typical_dimensions": [
+          0.03,
+          0.03,
+          0.15
+        ],
+        "mass_range": [
+          0.1,
+          0.6
+        ],
+        "graspability_modifier": -0.05,
+        "color_range": [
+          [
+            0.2,
+            0.2,
+            0.8
+          ],
+          [
+            0.4,
+            0.4,
+            1.0
+          ]
+        ]
+      },
+      "container": {
+        "base_success_rate": 0.5,
+        "typical_dimensions": [
+          0.12,
+          0.12,
+          0.08
+        ],
+        "mass_range": [
+          0.1,
+          0.4
+        ],
+        "graspability_modifier": 0.0,
+        "color_range": [
+          [
+            0.6,
+            0.6,
+            0.6
+          ],
+          [
+            0.8,
+            0.8,
+            0.8
+          ]
+        ]
+      },
+      "tool": {
+        "base_success_rate": 0.4,
+        "typical_dimensions": [
+          0.15,
+          0.05,
+          0.03
+        ],
+        "mass_range": [
+          0.1,
+          0.8
+        ],
+        "graspability_modifier": -0.1,
+        "color_range": [
+          [
+            0.3,
+            0.3,
+            0.3
+          ],
+          [
+            0.5,
+            0.5,
+            0.5
+          ]
+        ]
+      },
+      "block": {
+        "base_success_rate": 0.9,
+        "typical_dimensions": [
+          0.05,
+          0.05,
+          0.05
+        ],
+        "mass_range": [
+          0.05,
+          0.2
+        ],
+        "graspability_modifier": 0.15,
+        "color_range": [
+          [
+            0.8,
+            0.2,
+            0.2
+          ],
+          [
+            1.0,
+            0.4,
+            0.4
+          ]
+        ]
+      },
+      "fruit": {
+        "base_success_rate": 0.3,
+        "typical_dimensions": [
+          0.08,
+          0.04,
+          0.04
+        ],
+        "mass_range": [
+          0.05,
+          0.15
+        ],
+        "graspability_modifier": -0.2,
+        "color_range": [
+          [
+            0.8,
+            0.8,
+            0.2
+          ],
+          [
+            1.0,
+            1.0,
+            0.4
+          ]
+        ]
+      },
+      "unknown": {
+        "base_success_rate": 0.5,
+        "typical_dimensions": [
+          0.05,
+          0.05,
+          0.05
+        ],
+        "mass_range": [
+          0.1,
+          0.3
+        ],
+        "graspability_modifier": 0.0,
+        "color_range": [
+          [
+            0.5,
+            0.5,
+            0.5
+          ],
+          [
+            0.7,
+            0.7,
+            0.7
+          ]
+        ]
+      }
+    },
+    "exposure": {
+      "height_weight": 0.4,
+      "distance_weight": 0.3,
+      "occlusion_weight": 0.3,
+      "ray_directions": 8,
+      "ray_length": 0.5,
+      "height_threshold": 0.1,
+      "distance_threshold": 0.05,
+      "occlusion_threshold": 0.8
+    },
+    "evaluation": {
+      "eval_episodes": 20,
+      "eval_deterministic": true,
+      "eval_render": false,
+      "eval_save_video": true,
+      "eval_metrics": [
+        "success_rate",
+        "average_reward",
+        "average_episode_length",
+        "average_objects_grasped",
+        "average_exposure_score",
+        "category_success_rates"
+      ],
+      "eval_frequency": 50000,
+      "save_best_model": true
+    },
+    "logging": {
+      "tensorboard_log": "./logs/tensorboard",
+      "log_dir": "./logs",
+      "model_save_dir": "./models",
+      "video_save_dir": "./videos",
+      "checkpoint_dir": "./checkpoints",
+      "results_dir": "./results",
+      "log_level": "INFO",
+      "log_interval": 100,
+      "save_interval": 10000,
+      "video_interval": 50000,
+      "metrics_to_log": [
+        "episode_reward",
+        "episode_length",
+        "success_count",
+        "failure_count",
+        "success_rate",
+        "average_exposure",
+        "average_graspability",
+        "objects_remaining",
+        "policy_loss",
+        "value_loss",
+        "entropy_loss"
+      ]
+    },
+    "data": {
+      "collect_demonstrations": false,
+      "save_trajectories": true,
+      "save_observations": true,
+      "save_actions": true,
+      "save_rewards": true,
+      "save_metadata": true,
+      "trajectory_format": "hdf5",
+      "compression": "gzip",
+      "max_trajectories_per_file": 1000,
+      "max_file_size_mb": 500
+    },
+    "debug": {
+      "debug_mode": false,
+      "verbose_logging": false,
+      "save_debug_images": false,
+      "print_reward_breakdown": false,
+      "print_object_info": false,
+      "visualize_exposures": false,
+      "check_environment_consistency": true
+    },
+    "model": {
+      "feature_extractor": {
+        "type": "mlp",
+        "hidden_sizes": [
+          256,
+          256
+        ],
+        "activation": "relu",
+        "normalization": "layer_norm",
+        "dropout": 0.1
+      },
+      "policy_head": {
+        "hidden_sizes": [
+          128,
+          64
+        ],
+        "activation": "tanh",
+        "output_activation": "softmax"
+      },
+      "value_head": {
+        "hidden_sizes": [
+          128,
+          64
+        ],
+        "activation": "relu",
+        "output_activation": "linear"
+      },
+      "shared_backbone": true,
+      "use_attention": false,
+      "attention_heads": 4
+    }
+  }
+}
