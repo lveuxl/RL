@@ -29,7 +29,7 @@ from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 class EnvClutterEnv(BaseEnv):
     """
     **任务描述:**
-    复杂堆叠抓取环境，包含3种盒子形状的YCB物体堆积在托盘中。
+    复杂堆叠抓取环境，包含各种形状的YCB物体堆积在托盘中。
     机械臂需要挑选最适合抓取的物体，并将其放到指定位置。
     
     **随机化:**
@@ -47,18 +47,21 @@ class EnvClutterEnv(BaseEnv):
     SUPPORTED_ROBOTS = ["panda", "fetch"]
     agent: Union[Panda, Fetch]
     
-    # 三种盒子形状的YCB物体
+    # YCB物体
     BOX_OBJECTS = [
-        "002_master_chef_can",      # 圆柱形罐头
-        "003_cracker_box",          # 长方形饼干盒
-        "004_sugar_box",            # 方形糖盒
+        #"003_cracker_box",          # 饼干盒
+        "004_sugar_box",            # 糖盒
+        "006_mustard_bottle",       # 芥末瓶
+        "008_pudding_box",      # 布丁盒
+        #"009_gelatin_box",          # 明胶盒
+        #"010_potted_meat_can",      # 罐装肉罐头
     ]
     
     goal_thresh = 0.03  # 成功阈值
     # 托盘参数 (基于traybox.urdf的尺寸)
     tray_size = [0.6, 0.6, 0.15]  # 托盘内部尺寸 (长x宽x高)
-    tray_spawn_area = [0.25, 0.25]  # 托盘内物体生成区域 (考虑边界)
-    num_objects_per_type = 3  # 每种类型的物体数量
+    tray_spawn_area = [0.23, 0.23]  # 托盘内物体生成区域 (考虑边界墙和安全边距)
+    num_objects_per_type = 5  # 每种类型的物体数量
     
     def __init__(
         self,
@@ -247,9 +250,15 @@ class EnvClutterEnv(BaseEnv):
         tray_center_y = 0.0
         tray_bottom_z = 0.02 + 0.01  # 托盘底部 + 小偏移
         
+        # 托盘边界计算（基于URDF文件中的边界墙位置）
+        # 边界墙在托盘中心的±0.25米处，考虑边界墙厚度0.02米
+        # 实际可用空间：从中心向两边各0.23米（留出安全边距）
+        safe_spawn_area_x = 0.23
+        safe_spawn_area_y = 0.23
+        
         # 在托盘内随机生成xy位置
-        x = tray_center_x + random.uniform(-self.tray_spawn_area[0], self.tray_spawn_area[0])
-        y = tray_center_y + random.uniform(-self.tray_spawn_area[1], self.tray_spawn_area[1])
+        x = tray_center_x + random.uniform(-safe_spawn_area_x, safe_spawn_area_x)
+        y = tray_center_y + random.uniform(-safe_spawn_area_y, safe_spawn_area_y)
         
         # 堆叠高度
         z = tray_bottom_z + stack_level * 0.03  # 每层3cm高度
@@ -258,11 +267,15 @@ class EnvClutterEnv(BaseEnv):
 
     def _get_object_size(self, obj_type):
         """获取物体的大小信息"""
-        # 这里是YCB物体的近似尺寸
+        # 基于YCB数据集的实际物体尺寸（单位：米）
         sizes = {
-            "002_master_chef_can": [0.05, 0.05, 0.1],      # 圆柱形罐头
-            "003_cracker_box": [0.08, 0.06, 0.2],          # 长方形饼干盒
-            "004_sugar_box": [0.09, 0.06, 0.18],           # 方形糖盒
+            #"003_cracker_box": [0.16, 0.21, 0.07],         # 饼干盒: 16cm x 21cm x 7cm
+            "004_sugar_box": [0.09, 0.175, 0.044],         # 糖盒: 9cm x 17.5cm x 4.4cm
+            "006_mustard_bottle": [0.095, 0.095, 0.177],   # 芥末瓶: 9.5cm x 9.5cm x 17.7cm
+            "008_pudding_box": [0.078, 0.109, 0.032],      # 布丁盒: 7.8cm x 10.9cm x 3.2cm
+            #"009_gelatin_box": [0.028, 0.085, 0.114],      # 明胶盒: 2.8cm x 8.5cm x 11.4cm  
+            #"010_potted_meat_can": [0.101, 0.051, 0.051],  # 罐装肉罐头: 10.1cm x 5.1cm x 5.1cm
+           
         }
         return sizes.get(obj_type, [0.05, 0.05, 0.05])
 
