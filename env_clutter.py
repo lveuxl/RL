@@ -29,11 +29,11 @@ from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 class EnvClutterEnv(BaseEnv):
     """
     **任务描述:**
-    复杂堆叠抓取环境，包含3种盒子形状的YCB物体堆积在一起。
+    复杂堆叠抓取环境，包含3种盒子形状的YCB物体堆积在托盘中。
     机械臂需要挑选最适合抓取的物体，并将其放到指定位置。
     
     **随机化:**
-    - 物体在圆形区域内随机生成
+    - 物体在托盘内随机生成
     - 物体初始姿态随机化
     - 目标位置随机化
     
@@ -55,7 +55,9 @@ class EnvClutterEnv(BaseEnv):
     ]
     
     goal_thresh = 0.03  # 成功阈值
-    spawn_radius = 0.15  # 生成半径
+    # 托盘参数 (基于traybox.urdf的尺寸)
+    tray_size = [0.6, 0.6, 0.15]  # 托盘内部尺寸 (长x宽x高)
+    tray_spawn_area = [0.25, 0.25]  # 托盘内物体生成区域 (考虑边界)
     num_objects_per_type = 3  # 每种类型的物体数量
     
     def __init__(
@@ -122,6 +124,9 @@ class EnvClutterEnv(BaseEnv):
         )
         self.scene_builder.build()
         
+        # 加载托盘
+        self._load_tray()
+        
         # 创建物体列表
         self.all_objects = []
         self.selectable_objects = []
@@ -139,12 +144,8 @@ class EnvClutterEnv(BaseEnv):
                     # 创建物体
                     builder = actors.get_actor_builder(self.scene, id=f"ycb:{obj_type}")
                     
-                    # 在圆形区域内随机生成位置
-                    angle = random.uniform(0, 2 * np.pi)
-                    radius = random.uniform(0.05, self.spawn_radius)
-                    x = radius * np.cos(angle)
-                    y = radius * np.sin(angle)
-                    z = 0.05 + i * 0.02  # 堆叠高度
+                    # 在托盘内随机生成位置
+                    x, y, z = self._generate_object_position_in_tray(i)
                     
                     # 随机姿态
                     quat = randomization.random_quaternions(1)[0]
@@ -193,6 +194,68 @@ class EnvClutterEnv(BaseEnv):
         self.target_object = None
         self.target_object_indices = []
 
+    def _load_tray(self):
+        """加载托盘URDF文件"""
+        # 获取托盘URDF文件路径
+        tray_urdf_path = os.path.join(os.getcwd(), "assets", "tray", "traybox.urdf")
+        
+        if not os.path.exists(tray_urdf_path):
+            raise FileNotFoundError(f"托盘URDF文件未找到: {tray_urdf_path}")
+        
+        # 创建URDF加载器
+        loader = self.scene.create_urdf_loader()
+        
+        # 设置托盘的物理属性
+        loader.set_material(static_friction=0.8, dynamic_friction=0.6, restitution=0.1)
+        loader.fix_root_link = True  # 固定托盘不动
+        loader.scale = 1.0  # 保持原始尺寸
+        
+        # 解析URDF文件
+        parsed_result = loader.parse(tray_urdf_path)
+        
+        # 只使用 actor_builders 方式
+        actor_builders = parsed_result.get("actor_builders", [])
+        
+        if not actor_builders:
+            raise ValueError("托盘URDF文件中没有找到actor_builders")
+        
+        self.trays = []
+        
+        # 使用 actor_builders 加载托盘
+        print("使用actor builders加载托盘")
+        for env_idx in range(self.num_envs):
+            builder = actor_builders[0]
+            # 设置托盘位置 (放在桌面上，机器人前方)
+            tray_position = [0.1, 0.0, 0.02]  # 桌面高度加上托盘底部厚度
+            builder.initial_pose = sapien.Pose(p=tray_position)
+            builder.set_scene_idxs([env_idx])
+            
+            # 使用 build_static 创建静态托盘，确保不会移动
+            tray = builder.build_static(name=f"tray_{env_idx}")
+            self.trays.append(tray)
+        
+        # 合并所有托盘
+        if self.trays:
+            self.merged_trays = Actor.merge(self.trays, name="all_trays")
+        
+        print(f"成功加载托盘，共 {len(self.trays)} 个")
+
+    def _generate_object_position_in_tray(self, stack_level=0):
+        """在托盘内生成物体位置"""
+        # 托盘中心位置
+        tray_center_x = 0.1
+        tray_center_y = 0.0
+        tray_bottom_z = 0.02 + 0.01  # 托盘底部 + 小偏移
+        
+        # 在托盘内随机生成xy位置
+        x = tray_center_x + random.uniform(-self.tray_spawn_area[0], self.tray_spawn_area[0])
+        y = tray_center_y + random.uniform(-self.tray_spawn_area[1], self.tray_spawn_area[1])
+        
+        # 堆叠高度
+        z = tray_bottom_z + stack_level * 0.03  # 每层3cm高度
+        
+        return x, y, z
+
     def _get_object_size(self, obj_type):
         """获取物体的大小信息"""
         # 这里是YCB物体的近似尺寸
@@ -234,6 +297,14 @@ class EnvClutterEnv(BaseEnv):
             b = len(env_idx)
             self.scene_builder.initialize(env_idx)
             
+            # 重置托盘位置
+            if hasattr(self, 'merged_trays'):
+                if b == self.num_envs:
+                    self.merged_trays.pose = self.merged_trays.initial_pose
+                else:
+                    mask = torch.isin(self.merged_trays._scene_idxs, env_idx)
+                    self.merged_trays.pose = self.merged_trays.initial_pose[mask]
+            
             # 重置物体到初始位置
             if hasattr(self, 'merged_objects'):
                 if b == self.num_envs:
@@ -242,9 +313,9 @@ class EnvClutterEnv(BaseEnv):
                     mask = torch.isin(self.merged_objects._scene_idxs, env_idx)
                     self.merged_objects.pose = self.merged_objects.initial_pose[mask]
             
-            # 设置目标位置
+            # 设置目标位置 (在托盘外侧)
             goal_pos = torch.zeros((b, 3), device=self.device)
-            goal_pos[:, 0] = torch.rand(b, device=self.device) * 0.3 + 0.3  # 右侧区域
+            goal_pos[:, 0] = torch.rand(b, device=self.device) * 0.3 + 0.4  # 托盘右侧区域
             goal_pos[:, 1] = torch.rand(b, device=self.device) * 0.2 - 0.1  # y方向随机
             goal_pos[:, 2] = 0.05  # 桌面高度
             
