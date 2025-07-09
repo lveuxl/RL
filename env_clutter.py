@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import Any, Dict, List, Union
 import numpy as np
 import sapien
@@ -9,6 +10,11 @@ import random
 import mani_skill.envs.utils.randomization as randomization
 from mani_skill import ASSET_DIR
 from mani_skill.agents.robots import Fetch, Panda
+
+# 直接导入PandaSuction类
+sys.path.append(os.path.join(os.path.dirname(__file__), 'agents', 'robots', 'panda'))
+from panda_suction import PandaSuction
+
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
@@ -43,8 +49,8 @@ class EnvClutterEnv(BaseEnv):
     """
     
     SUPPORTED_REWARD_MODES = ["dense", "sparse"]
-    SUPPORTED_ROBOTS = ["panda", "fetch", "panda_stick"]
-    agent: Union[Panda, Fetch]
+    SUPPORTED_ROBOTS = ["panda", "fetch", "panda_stick", "panda_suction"]  # 添加panda_suction支持
+    agent: Union[Panda, Fetch, PandaSuction]  # 添加类型注解
     
     # YCB物体
     BOX_OBJECTS = [
@@ -65,7 +71,7 @@ class EnvClutterEnv(BaseEnv):
     def __init__(
         self,
         *args,
-        robot_uids="panda_stick",
+        robot_uids="panda_suction",  # 默认使用panda_suction
         robot_init_qpos_noise=0.02,
         num_envs=1,
         **kwargs,
@@ -195,6 +201,10 @@ class EnvClutterEnv(BaseEnv):
         # 初始化目标物体相关变量
         self.target_object = None
         self.target_object_indices = []
+        
+        # 吸盘控制相关变量
+        self.suction_command = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.prev_suction_command = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
     def _load_tray(self):
         """加载托盘URDF文件"""
@@ -304,6 +314,50 @@ class EnvClutterEnv(BaseEnv):
                 exposed_area = max(0.1, 1.0 - i * 0.1)  # 越高的物体暴露面积越大
                 obj_info['exposed_area'] = exposed_area
 
+    def _handle_suction_control(self, action):
+        """处理吸盘控制逻辑"""
+        if not hasattr(self.agent, 'activate_suction'):
+            return  # 如果不是吸盘机器人，直接返回
+        
+        # 检查动作是否包含吸盘控制信号
+        # 假设动作的最后一个维度是吸盘控制（0=关闭，1=开启）
+        if action.shape[-1] > 7:  # 超过7维的动作空间包含吸盘控制
+            suction_action = action[..., -1] > 0.5  # 阈值判断
+            
+            for env_idx in range(self.num_envs):
+                current_command = suction_action[env_idx]
+                prev_command = self.prev_suction_command[env_idx]
+                
+                # 检测吸盘控制信号的变化
+                if current_command and not prev_command:
+                    # 激活吸盘
+                    if hasattr(self, 'target_object') and self.target_object is not None:
+                        success = self.agent.activate_suction(self.target_object)
+                        if success:
+                            print(f"环境 {env_idx}: 吸盘激活成功")
+                
+                elif not current_command and prev_command:
+                    # 关闭吸盘
+                    success = self.agent.deactivate_suction()
+                    if success:
+                        print(f"环境 {env_idx}: 吸盘关闭成功")
+                
+                self.prev_suction_command[env_idx] = current_command
+
+    def step(self, action):
+        """重写step方法以处理吸盘控制"""
+        # 处理吸盘控制
+        self._handle_suction_control(action)
+        
+        # 如果动作包含吸盘控制，需要移除吸盘控制维度
+        if action.shape[-1] > 7:
+            arm_action = action[..., :7]  # 只保留机械臂控制
+        else:
+            arm_action = action
+        
+        # 调用父类的step方法
+        return super().step(arm_action)
+
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             b = len(env_idx)
@@ -350,40 +404,82 @@ class EnvClutterEnv(BaseEnv):
             
             # 重新选择目标物体
             self._sample_target_objects()
+            
+            # 重置吸盘控制状态
+            self.suction_command[env_idx] = False
+            self.prev_suction_command[env_idx] = False
+            
+            # 如果是吸盘机器人，确保吸盘处于关闭状态
+            if hasattr(self.agent, 'deactivate_suction'):
+                self.agent.deactivate_suction()
 
     def _get_obs_extra(self, info: Dict):
         """获取额外观测信息"""
         # 获取批次大小
         batch_size = self.num_envs
         
-        # 基础观测信息
-        obs = dict(
-            is_grasped=info["is_grasped"],
-            tcp_pose=self.agent.tcp.pose.raw_pose,
-            goal_pos=self.goal_site.pose.p,
-        )
+        # 基础观测信息 - 确保所有项都有正确的批次维度
+        obs = dict()
+        
+        # is_grasped 已经是正确的批次维度
+        obs["is_grasped"] = info["is_grasped"]
+        
+        # tcp_pose - 确保有正确的批次维度
+        tcp_pose = self.agent.tcp.pose.raw_pose
+        if tcp_pose.shape[0] != batch_size:
+            tcp_pose = tcp_pose.repeat(batch_size, 1)
+        obs["tcp_pose"] = tcp_pose
+        
+        # goal_pos - 确保有正确的批次维度
+        goal_pos = self.goal_site.pose.p
+        if goal_pos.shape[0] != batch_size:
+            goal_pos = goal_pos.repeat(batch_size, 1)
+        obs["goal_pos"] = goal_pos
+        
+        # 添加吸盘状态信息
+        if hasattr(self.agent, 'suction_state'):
+            try:
+                suction_state = self.agent.suction_state
+                # 创建批次大小的布尔张量
+                suction_active = torch.full((batch_size,), suction_state['is_active'], 
+                                          device=self.device, dtype=torch.bool)
+                obs["suction_active"] = suction_active
+            except:
+                # 如果获取吸盘状态失败，提供默认值
+                obs["suction_active"] = torch.zeros(batch_size, device=self.device, dtype=torch.bool)
+        else:
+            # 如果没有吸盘状态，提供默认值
+            obs["suction_active"] = torch.zeros(batch_size, device=self.device, dtype=torch.bool)
         
         if "state" in self.obs_mode:
             if hasattr(self, 'target_object') and self.target_object is not None:
-                obs.update(
-                    target_obj_pose=self.target_object.pose.raw_pose,
-                    tcp_to_obj_pos=self.target_object.pose.p - self.agent.tcp.pose.p,
-                    obj_to_goal_pos=self.goal_site.pose.p - self.target_object.pose.p,
-                )
+                # target_obj_pose - 确保有正确的批次维度
+                target_obj_pose = self.target_object.pose.raw_pose
+                if target_obj_pose.shape[0] != batch_size:
+                    target_obj_pose = target_obj_pose.repeat(batch_size, 1)
+                obs["target_obj_pose"] = target_obj_pose
+                
+                # tcp_to_obj_pos - 确保有正确的批次维度
+                tcp_to_obj_pos = self.target_object.pose.p - self.agent.tcp.pose.p
+                if tcp_to_obj_pos.shape[0] != batch_size:
+                    tcp_to_obj_pos = tcp_to_obj_pos.repeat(batch_size, 1)
+                obs["tcp_to_obj_pos"] = tcp_to_obj_pos
+                
+                # obj_to_goal_pos - 确保有正确的批次维度
+                obj_to_goal_pos = self.goal_site.pose.p - self.target_object.pose.p
+                if obj_to_goal_pos.shape[0] != batch_size:
+                    obj_to_goal_pos = obj_to_goal_pos.repeat(batch_size, 1)
+                obs["obj_to_goal_pos"] = obj_to_goal_pos
             else:
                 # 如果没有目标物体，提供零张量以保持维度一致
-                zero_pose = torch.zeros((batch_size, 7), device=self.device)
-                zero_pos = torch.zeros((batch_size, 3), device=self.device)
-                obs.update(
-                    target_obj_pose=zero_pose,
-                    tcp_to_obj_pos=zero_pos,
-                    obj_to_goal_pos=zero_pos,
-                )
+                obs["target_obj_pose"] = torch.zeros((batch_size, 7), device=self.device)
+                obs["tcp_to_obj_pos"] = torch.zeros((batch_size, 3), device=self.device)
+                obs["obj_to_goal_pos"] = torch.zeros((batch_size, 3), device=self.device)
             
             # 添加标量观测信息，确保维度一致
-            obs.update(
-                num_objects=torch.tensor([len(self.all_objects)], device=self.device).repeat(batch_size),
-            )
+            num_objects = torch.full((batch_size,), len(self.all_objects), 
+                                   device=self.device, dtype=torch.int64)
+            obs["num_objects"] = num_objects
         
         return obs
 
@@ -481,7 +577,7 @@ class EnvClutterEnv(BaseEnv):
         
         # 6. 静止奖励
         static_reward = 1 - torch.tanh(
-            5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], axis=1)
+            5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :], axis=1)  # 吸盘版本包含所有关节
         )
         reward += static_reward * info["is_obj_placed"] * 1.0
         
