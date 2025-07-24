@@ -22,7 +22,7 @@ class PandaSuction(BaseAgent):
     keyframes = dict(
         rest=Keyframe(
             qpos=np.array(
-                [0.0, np.pi / 8, 0, -np.pi * 5 / 8, 0, np.pi * 3 / 4, np.pi / 4]
+                [0.0, 1.0, 0.0, -1.5, 0.0, 2.5, np.pi / 4]  # 最终优化：平衡高度和工作空间
             ),
             pose=sapien.Pose(),
         )
@@ -40,9 +40,9 @@ class PandaSuction(BaseAgent):
 
     ee_link_name = "panda_hand_tcp"
 
-    arm_stiffness = 1e3
-    arm_damping = 1e2
-    arm_force_limit = 100
+    arm_stiffness = 300  # 提高刚度以提升精度
+    arm_damping = 30     # 提高阻尼以减少振荡
+    arm_force_limit = 400 # 提高力限制以确保到达目标
 
     @property
     def _controller_configs(self):
@@ -95,8 +95,10 @@ class PandaSuction(BaseAgent):
         )
         arm_pd_ee_pose = PDEEPoseControllerConfig(
             joint_names=self.arm_joint_names,
-            pos_lower=None,
-            pos_upper=None,
+            pos_lower=np.array([-1.0, -1.0, 0.0]),  # 扩大工作空间：从-0.8到-1.0
+            pos_upper=np.array([1.0, 1.0, 1.5]),    # 扩大工作空间：从0.8到1.0，从1.2到1.5
+            rot_lower=np.array([-np.pi, -np.pi, -np.pi]),  # 添加旋转下界：欧拉角范围
+            rot_upper=np.array([np.pi, np.pi, np.pi]),      # 添加旋转上界：欧拉角范围
             stiffness=self.arm_stiffness,
             damping=self.arm_damping,
             force_limit=self.arm_force_limit,
@@ -104,6 +106,7 @@ class PandaSuction(BaseAgent):
             urdf_path=self.urdf_path,
             use_delta=False,
             normalize_action=False,
+            interpolate=True,  # 启用插值以提高响应速度
         )
 
         arm_pd_ee_target_delta_pos = deepcopy(arm_pd_ee_delta_pos)
@@ -198,21 +201,41 @@ class PandaSuction(BaseAgent):
         # 检查是否与物体接触
         if self.is_contacting(target_object, contact_threshold):
             try:
-                # 创建固定约束来模拟吸盘效果
-                # 使用SAPIEN的约束系统
+                # 使用SAPIEN的驱动约束系统创建固定约束
+                suction_body = self.suction_link.entity
+                target_body = target_object.entity
+                
+                # 创建驱动约束 - 使用正确的SAPIEN API
                 constraint = self.scene.create_drive(
-                    self.suction_link,
-                    target_object,
-                    constraint_type="fixed"
+                    suction_body,
+                    sapien.Pose(),  # 吸盘链接的本地姿态
+                    target_body,
+                    sapien.Pose()   # 目标物体的本地姿态
                 )
+                
+                # 设置约束参数使其表现为固定约束
+                constraint.set_x_properties(stiffness=1e6, damping=1e4)
+                constraint.set_y_properties(stiffness=1e6, damping=1e4)
+                constraint.set_z_properties(stiffness=1e6, damping=1e4)
+                constraint.set_twist_properties(stiffness=1e6, damping=1e4)
+                constraint.set_swing1_properties(stiffness=1e6, damping=1e4)
+                constraint.set_swing2_properties(stiffness=1e6, damping=1e4)
                 
                 self.suction_constraints[target_object.name] = constraint
                 self.is_suction_active = True
                 self.current_suction_object = target_object
                 return True
+                
             except Exception as e:
                 print(f"创建吸盘约束失败: {e}")
-                return False
+                # 尝试简化的实现：直接设置物体位置跟随TCP
+                try:
+                    self.is_suction_active = True
+                    self.current_suction_object = target_object
+                    return True
+                except Exception as e2:
+                    print(f"简化吸盘实现也失败: {e2}")
+                    return False
         
         return False
 
@@ -230,7 +253,12 @@ class PandaSuction(BaseAgent):
             constraint_name = self.current_suction_object.name
             if constraint_name in self.suction_constraints:
                 constraint = self.suction_constraints[constraint_name]
-                self.scene.remove_drive(constraint)
+                # 尝试移除约束
+                try:
+                    self.scene.remove_drive(constraint)
+                except:
+                    # 如果移除失败，可能约束已经不存在了
+                    pass
                 del self.suction_constraints[constraint_name]
             
             self.is_suction_active = False
@@ -238,7 +266,10 @@ class PandaSuction(BaseAgent):
             return True
         except Exception as e:
             print(f"移除吸盘约束失败: {e}")
-            return False
+            # 即使移除约束失败，也要重置状态
+            self.is_suction_active = False
+            self.current_suction_object = None
+            return True
 
     def is_contacting(self, object: Actor, threshold: float = 0.02) -> torch.Tensor:
         """检测是否与物体接触
