@@ -5,68 +5,45 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical  # 改为Categorical分布
+from torch.distributions import Normal
 from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
 from collections import deque
 import mani_skill.envs
 from env_clutter import EnvClutterEnv
-from utils import CsvLogger  # 导入CsvLogger
 import warnings
 warnings.filterwarnings("ignore")
 
 class PPOActor(nn.Module):
-    """PPO Actor网络 - 支持离散动作"""
+    """PPO Actor网络"""
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(PPOActor, self).__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim)
-        self.logits_layer = nn.Linear(hidden_dim, action_dim)  # 输出logits
+        self.mean_layer = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
         
-    def forward(self, state, mask=None):
+    def forward(self, state):
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
-        logits = self.logits_layer(x)
-        
-        # 不在forward中应用掩码，只返回原始logits
-        return logits
+        mean = self.mean_layer(x)
+        std = torch.exp(self.log_std.clamp(-5, 2))
+        return mean, std
     
-    def get_action(self, state, mask=None):
-        logits = self.forward(state, mask)
-        
-        # 屏蔽非法动作
-        if mask is not None:
-            # 确保掩码是0/1值
-            if not torch.all((mask == 0) | (mask == 1)):
-                # 如果掩码不是0/1值，将其转换为0/1值
-                # 假设非零值表示有效动作
-                mask = (mask != 0).float()
-            
-            logits = torch.where(mask.bool(), logits, torch.tensor(-1e8, device=logits.device))
-        
-        dist = Categorical(logits=logits)
+    def get_action(self, state):
+        mean, std = self.forward(state)
+        dist = Normal(mean, std)
         action = dist.sample()
-        log_prob = dist.log_prob(action)
+        log_prob = dist.log_prob(action).sum(dim=-1)
         return action, log_prob
     
-    def evaluate_action(self, state, action, mask=None):
-        logits = self.forward(state, mask)
-        
-        # 屏蔽非法动作
-        if mask is not None:
-            # 确保掩码是0/1值
-            if not torch.all((mask == 0) | (mask == 1)):
-                # 如果掩码不是0/1值，将其转换为0/1值
-                # 假设非零值表示有效动作
-                mask = (mask != 0).float()
-            
-            logits = torch.where(mask.bool(), logits, torch.tensor(-1e8, device=logits.device))
-        
-        dist = Categorical(logits=logits)
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
+    def evaluate_action(self, state, action):
+        mean, std = self.forward(state)
+        dist = Normal(mean, std)
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
         return log_prob, entropy
 
 class PPOCritic(nn.Module):
@@ -106,12 +83,10 @@ class PPOAgent:
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         
-    def get_action(self, state, mask=None):
+    def get_action(self, state):
         state = torch.FloatTensor(state).to(self.device)
-        if mask is not None:
-            mask = torch.FloatTensor(mask).to(self.device)
         with torch.no_grad():
-            action, log_prob = self.actor.get_action(state, mask)
+            action, log_prob = self.actor.get_action(state)
         return action.cpu().numpy(), log_prob.item()
     
     def get_value(self, state):
@@ -137,17 +112,13 @@ class PPOAgent:
         
         return advantages
     
-    def update(self, states, actions, old_log_probs, rewards, values, dones, masks=None, epochs=10):
-        """更新网络 - 适配离散动作"""
+    def update(self, states, actions, old_log_probs, rewards, values, dones, epochs=10):
+        """更新网络"""
         # 转换为张量
         states = torch.FloatTensor(np.array(states)).to(self.device)
-        actions = torch.LongTensor(np.array(actions)).to(self.device)  # 离散动作用LongTensor
+        actions = torch.FloatTensor(np.array(actions)).to(self.device)
         
-        # 处理masks
-        if masks is not None:
-            masks = torch.FloatTensor(np.array(masks)).to(self.device)
-        
-        # 处理old_log_probs
+        # 处理old_log_probs，确保是正确的形状
         old_log_probs_array = []
         for log_prob in old_log_probs:
             if isinstance(log_prob, torch.Tensor):
@@ -160,7 +131,7 @@ class PPOAgent:
         
         rewards = torch.FloatTensor(rewards).to(self.device)
         
-        # 处理values
+        # 处理values，确保是正确的形状
         values_array = []
         for value in values:
             if isinstance(value, torch.Tensor):
@@ -185,8 +156,7 @@ class PPOAgent:
         # 更新网络
         for _ in range(epochs):
             # Actor损失
-            current_mask = masks if masks is not None else None
-            new_log_probs, entropy = self.actor.evaluate_action(states, actions, current_mask)
+            new_log_probs, entropy = self.actor.evaluate_action(states, actions)
             ratio = torch.exp(new_log_probs - old_log_probs)
             
             surr1 = ratio * advantages
@@ -228,11 +198,11 @@ class PPOAgent:
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
 
 def flatten_obs(obs):
-    """展平观测 - 支持离散动作观测"""
+    """展平观测"""
     if isinstance(obs, dict):
         flattened = []
         for key in sorted(obs.keys()):
-            if key in ['sensor_data']:
+            if key == 'sensor_data':
                 continue  # 跳过图像数据
             value = obs[key]
             if isinstance(value, torch.Tensor):
@@ -253,47 +223,6 @@ def flatten_obs(obs):
         else:
             return torch.tensor(obs).flatten()
 
-def extract_mask(obs):
-    """从观测中提取动作掩码"""
-    MAX_N = 15  # 与env_clutter.py中的MAX_N保持一致
-    
-    if isinstance(obs, dict) and 'discrete_action_obs' in obs:
-        discrete_obs = obs['discrete_action_obs']
-        if isinstance(discrete_obs, torch.Tensor):
-            # discrete_action_obs的结构：[action_mask(MAX_N), object_features(MAX_N*7), step_count(1)]
-            # 我们需要提取前MAX_N个元素作为action_mask
-            mask = discrete_obs[:MAX_N] if discrete_obs.dim() == 1 else discrete_obs[:, :MAX_N]
-            mask = mask.cpu().numpy()
-            # 确保返回1D数组
-            if mask.ndim > 1:
-                mask = mask.flatten()
-            return mask
-        elif isinstance(discrete_obs, np.ndarray):
-            mask = discrete_obs[:MAX_N] if discrete_obs.ndim == 1 else discrete_obs[:, :MAX_N]
-            # 确保返回1D数组
-            if mask.ndim > 1:
-                mask = mask.flatten()
-            return mask
-    elif isinstance(obs, torch.Tensor):
-        # 如果obs直接是张量，说明是修改后的环境返回的展平观测
-        # 新的观测结构：按字母顺序排列的键
-        # discrete_action_obs是第一个键，包含121个元素
-        # 其中前15个是掩码
-        
-        if obs.dim() == 1:
-            # 1D张量，直接提取前15个元素作为掩码
-            mask = obs[:MAX_N]
-        else:
-            # 2D张量，取第一个batch的前15个元素
-            mask = obs[0, :MAX_N]
-        
-        mask = mask.cpu().numpy()
-        # 确保返回1D数组
-        if mask.ndim > 1:
-            mask = mask.flatten()
-        return mask
-    return None
-
 def train_ppo(args):
     """训练PPO智能体"""
     # 创建环境
@@ -304,21 +233,13 @@ def train_ppo(args):
         control_mode="pd_ee_delta_pose",
         reward_mode="dense",
         render_mode="human" if args.render else None,
-        use_discrete_action=True,  # 启用离散动作
     )
     
     # 获取状态和动作维度
     obs, _ = env.reset()
     flattened_obs = flatten_obs(obs)
     state_dim = flattened_obs.shape[0]
-    
-    # 获取动作维度
-    if hasattr(env, 'discrete_action_space') and env.discrete_action_space is not None:
-        action_dim = env.discrete_action_space.n
-        print(f"使用离散动作空间，动作维度: {action_dim}")
-    else:
-        action_dim = env.action_space.shape[0]
-        print(f"使用连续动作空间，动作维度: {action_dim}")
+    action_dim = env.action_space.shape[0]
     
     print(f"状态维度: {state_dim}, 动作维度: {action_dim}")
     print(f"渲染模式: {'开启' if args.render else '关闭'}")
@@ -328,7 +249,6 @@ def train_ppo(args):
     
     # 创建日志记录器
     writer = SummaryWriter(log_dir=args.log_dir)
-    csv_logger = CsvLogger(os.path.join(args.log_dir, "training_log.csv"))
     
     # 训练循环
     episode_rewards = deque(maxlen=100)
@@ -339,12 +259,11 @@ def train_ppo(args):
     
     for epoch in range(args.epochs):
         # 收集数据
-        states, actions, log_probs, rewards, values, dones, masks = [], [], [], [], [], [], []
+        states, actions, log_probs, rewards, values, dones = [], [], [], [], [], []
         
         obs, _ = env.reset()
         episode_reward = 0
         episode_success = 0
-        total_displacement = 0
         
         print(f"\n--- Epoch {epoch + 1}/{args.epochs} ---")
         
@@ -353,11 +272,8 @@ def train_ppo(args):
             flattened_obs = flatten_obs(obs)
             state = flattened_obs.cpu().numpy() if isinstance(flattened_obs, torch.Tensor) else flattened_obs
             
-            # 提取掩码
-            mask = extract_mask(obs)
-            
             # 获取动作
-            action, log_prob = agent.get_action(state, mask)
+            action, log_prob = agent.get_action(state)
             value = agent.get_value(state)
             
             # 执行动作
@@ -367,9 +283,11 @@ def train_ppo(args):
             # 渲染环境
             if args.render:
                 env.render()
+                # 添加小延迟以便观察
+                import time
                 time.sleep(0.01)
             
-            # 处理奖励和信息
+            # 处理奖励和信息（确保是标量）
             if isinstance(reward, torch.Tensor):
                 reward = reward.item() if reward.numel() == 1 else reward.mean().item()
             elif isinstance(reward, np.ndarray):
@@ -383,10 +301,8 @@ def train_ppo(args):
             
             # 处理成功信息
             success = False
-            displacement = 0.0
             if isinstance(info, dict):
                 success = info.get('success', False)
-                displacement = info.get('displacement', 0.0)
                 if isinstance(success, torch.Tensor):
                     success = success.item() if success.numel() == 1 else success.any().item()
                 elif isinstance(success, np.ndarray):
@@ -399,11 +315,8 @@ def train_ppo(args):
             rewards.append(reward)
             values.append(value)
             dones.append(done)
-            if mask is not None:
-                masks.append(mask)
             
             episode_reward += reward
-            total_displacement += displacement
             if success:
                 episode_success = 1
             
@@ -426,14 +339,12 @@ def train_ppo(args):
                 obs, _ = env.reset()
                 episode_reward = 0
                 episode_success = 0
-                total_displacement = 0
         
         # 更新智能体
         if len(states) > 0:
             print(f"更新智能体，数据量: {len(states)}")
-            mask_data = masks if len(masks) > 0 else None
             actor_loss, critic_loss = agent.update(
-                states, actions, log_probs, rewards, values, dones, mask_data
+                states, actions, log_probs, rewards, values, dones
             )
             
             # 记录日志
@@ -444,18 +355,6 @@ def train_ppo(args):
             writer.add_scalar('Training/Success_Rate', avg_success_rate, epoch)
             writer.add_scalar('Training/Actor_Loss', actor_loss, epoch)
             writer.add_scalar('Training/Critic_Loss', critic_loss, epoch)
-            
-            # CSV日志
-            csv_logger.log({
-                'epoch': epoch,
-                'episode': episode_count,
-                'avg_reward': avg_reward,
-                'success_rate': avg_success_rate,
-                'total_displacement': total_displacement,
-                'steps': total_steps,
-                'actor_loss': actor_loss,
-                'critic_loss': critic_loss
-            })
             
             if epoch % args.log_interval == 0:
                 print(f"Epoch {epoch}, "

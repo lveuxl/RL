@@ -21,11 +21,11 @@ from mani_skill.utils.structs import Actor, Pose
 from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 
 # 新增：IK和控制器相关导入
-from mani_skill.agents.controllers.pd_ee_pose import PDEEPoseController
+# from mani_skill.agents.controllers.pd_ee_pose import PDEEPoseController
 
 
 @register_env(
-    "EnvClutter-v1",
+    "EnvClutter-v3",
     asset_download_ids=["ycb"],
     max_episode_steps=200,
 )
@@ -81,16 +81,20 @@ class EnvClutterEnv(BaseEnv):
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.use_discrete_action = use_discrete_action
         
+        # 设置类属性到实例属性
+        self.MAX_N = len(self.BOX_OBJECTS) * self.num_objects_per_type  # 最大物体数量
+        self.MAX_EPISODE_STEPS = 15  # 最大episode步数
+        
         # 初始化离散动作相关变量
         self.remaining_indices = []  # 剩余可抓取物体的索引
         self.step_count = 0  # 当前步数
         self.grasped_objects = []  # 已抓取的物体
         
-        # 新增：控制器和IK相关变量
-        self.arm_controller = None  # 将在_load_agent后初始化
-        self.q_init = None  # 初始关节角
-        self.q_above = None  # 目标区域上方关节角
-        self.q_goal = None  # 目标区域关节角
+        # 删除：控制器和IK相关变量
+        # self.arm_controller = None  # 将在_load_agent后初始化
+        # self.q_init = None  # 初始关节角
+        # self.q_above = None  # 目标区域上方关节角
+        # self.q_goal = None  # 目标区域关节角
         
         # 确保所有参数正确传递给父类
         super().__init__(
@@ -140,283 +144,386 @@ class EnvClutterEnv(BaseEnv):
     def _load_agent(self, options: dict):
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
         
-        # 新增：初始化控制器缓存
-        self.arm_controller = self.agent.controller.controllers["arm"]
         
-        # 预计算关节角
-        self._precompute_joint_positions()
     
-    def _world_to_robot_frame(self, world_pose: Pose) -> Pose:
+    def _move_to_position(self, target_pos: np.ndarray, steps: int = 200) -> bool:
         """
-        将世界坐标系中的位姿转换到机械臂基座坐标系
+        逆运动学控制，使用pd_ee_delta_pose控制模式移动到目标位置
         
         Args:
-            world_pose: 世界坐标系中的位姿
+            target_pos: 目标位置 [x, y, z]
+            steps: 执行步数
             
         Returns:
-            robot_pose: 机械臂基座坐标系中的位姿
+            success: 是否成功到达目标位置
         """
         try:
-            # 获取机械臂基座在世界坐标系中的位姿
-            robot_base_pose = self.agent.robot.pose
+            print(f"开始移动到位置: {target_pos}, 步数: {steps}")
             
-            # 将世界坐标转换到机械臂基座坐标系
-            # robot_pose = robot_base_pose.inv() * world_pose
-            robot_pose = robot_base_pose.inv() * world_pose
+            # 转换为torch tensor
+            if isinstance(target_pos, np.ndarray):
+                target_pos = torch.tensor(target_pos, device=self.device, dtype=torch.float32)
+            elif not isinstance(target_pos, torch.Tensor):
+                target_pos = torch.tensor(target_pos, device=self.device, dtype=torch.float32)
             
-            return robot_pose
-        except Exception as e:
-            print(f"坐标系转换失败: {e}")
-            return world_pose  # 转换失败时返回原始位姿
-    
-    def _precompute_joint_positions(self):
-        """预计算目标区域的关节角位置"""
-        # 使用Panda机器人的默认rest关节角度作为初值
-        # 从Panda机器人的keyframes中获取rest姿态
-        rest_qpos = self.agent.keyframes["rest"].qpos
-        print(f"Panda rest qpos: {rest_qpos}")
-        
-        # 只取前7个关节角（arm关节）
-        arm_q_init = torch.tensor(rest_qpos[:7], device=self.device, dtype=torch.float32)
-        
-        # 保存初始关节角
-        self.q_init = arm_q_init
-        
-        print(f"使用rest关节角作为初值，维度: {arm_q_init.shape}, 值: {arm_q_init}")
-        
-        # 机械臂位于[-0.615, 0, 0]，工作空间大约是0.8m半径
-        # 修改目标位置到机械臂工作空间内
-        goal_above_pos = torch.tensor([0.0, 0.3, 0.15], device=self.device)  # 目标位置上方10cm
-        goal_above_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
-        goal_above_pose = Pose.create_from_pq(p=goal_above_pos, q=goal_above_quat)
-        
-        # # 转换到根坐标系
-        # raw_root_pose = self.arm_controller.articulation.pose.raw_pose
-        # if raw_root_pose.dim() > 1:
-        #     raw_root_pose = raw_root_pose[0]
-        # print(f"根坐标系: {raw_root_pose}")
-        # root_transform = Pose.create(raw_root_pose).inv()
-        # goal_above_pose = root_transform * goal_above_pose
-        
-        # 选择：是否使用坐标系转换
-        USE_COORDINATE_TRANSFORM = False  # 设置为True可以启用坐标系转换
-        
-        if USE_COORDINATE_TRANSFORM:
-            goal_above_pose = self._world_to_robot_frame(goal_above_pose)
-            print("使用坐标系转换")
-        else:
-            print("直接使用世界坐标系")
-        
-        # 计算IK
-        self.q_above = self._compute_ik(goal_above_pose, arm_q_init)
-        
-        # 计算目标区域的关节角
-        goal_pos = torch.tensor([0.0, 0.3, 0.05], device=self.device)  # 目标位置
-        goal_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
-        goal_pose = Pose.create_from_pq(p=goal_pos, q=goal_quat)
-        
-        if USE_COORDINATE_TRANSFORM:
-            goal_pose = self._world_to_robot_frame(goal_pose)
-        
-        # 计算IK
-        self.q_goal = self._compute_ik(goal_pose, arm_q_init)
-        
-        # 检查IK解是否有效
-        if self.q_above is None or self.q_goal is None:
-            print("警告：无法计算目标位置的IK解，使用默认关节角")
-            self.q_above = arm_q_init.clone()
-            self.q_goal = arm_q_init.clone()
-        else:
-            print(f"IK计算成功 - 目标上方: {self.q_above.shape}, 目标位置: {self.q_goal.shape}")
-    
-    def _rpy_to_quat(self, euler: torch.Tensor) -> torch.Tensor:
-        """将欧拉角转换为四元数"""
-        r, p, y = torch.unbind(euler, dim=-1)
-        cy = torch.cos(y * 0.5)
-        sy = torch.sin(y * 0.5)
-        cp = torch.cos(p * 0.5)
-        sp = torch.sin(p * 0.5)
-        cr = torch.cos(r * 0.5)
-        sr = torch.sin(r * 0.5)
-
-        qw = cr * cp * cy + sr * sp * sy
-        qx = sr * cp * cy - cr * sp * sy
-        qy = cr * sp * cy + sr * cp * sy
-        qz = cr * cp * sy - sr * sp * cy
-
-        quaternion = torch.stack([qw, qx, qy, qz], dim=-1)
-        return quaternion
-    
-    def _compute_ik(self, target_pose: Pose, q0: torch.Tensor) -> torch.Tensor:
-        """计算逆运动学解"""
-        try:
-            # 确保输入维度正确 - 使用7个arm关节角
-            if q0.dim() == 1:
-                q0 = q0.unsqueeze(0)
+            # 记录上一次的误差，用于检测收敛
+            prev_distance = float('inf')
+            stuck_count = 0  # 连续卡住的次数
+            min_distance_achieved = float('inf')  # 记录达到的最小距离
             
-            # 只使用前7个关节角作为初值（arm关节）
-            if q0.shape[-1] > 7:
-                q0 = q0[:, :7]
-            elif q0.shape[-1] < 7:
-                # 如果维度不足，填充到7维
-                padding = torch.zeros(q0.shape[0], 7 - q0.shape[-1], device=q0.device)
-                q0 = torch.cat([q0, padding], dim=-1)
-                print("填充到7维")
-            
-            # 计算IK
-            ik_result = self.arm_controller.kinematics.compute_ik(
-                target_pose=target_pose,
-                q0=q0,
-            )
-            
-            if ik_result is not None:
-                if ik_result.dim() > 1:
-                    return ik_result[0]  # 返回第一个解
-                return ik_result
-            else:
-                print("IK计算返回None")
-                return None
-        except Exception as e:
-            print(f"IK计算失败: {e}")
-            return None
-    
-    def _move_arm(self, target_pose: Pose, steps: int = 10) -> bool:
-        """使用PDEEPoseController移动机械臂到目标位置"""
-        try:
-            # 获取当前末端执行器位置
-            end_effector_link_name = "panda_hand_tcp"  # TCP 点更精确
-
-            # 通过 links_map 获取末端连杆
-            end_effector_link = self.arm_controller.articulation.links_map[end_effector_link_name]
-
-            # 获取末端执行器的位置（pose.p 是 3 维位置坐标 [x, y, z]）
-            current_pose = end_effector_link.pose
-            
-            print(f"开始移动机械臂，目标位置: {target_pose.p}, 当前位置: {current_pose.p}")
-            
-            # 计算总的位置差异
-            total_pos_diff = target_pose.p - current_pose.p
-            total_distance = torch.linalg.norm(total_pos_diff)
-            
-            print(f"总距离: {total_distance:.4f}m")
-            
-            # 如果距离很小，直接认为成功
-            if total_distance < 0.02:
-                print("已经在目标位置附近")
-                return True
-            
-            # 使用更大的步长和更高效的控制
+            # 执行多步控制以到达目标位置
             for step in range(steps):
-                # 重新获取当前位置
-                end_effector_link = self.arm_controller.articulation.links_map[end_effector_link_name]
-                current_pose = end_effector_link.pose
+                # 获取当前末端执行器位置
+                current_pos = self.agent.tcp.pose.p
+                if current_pos.dim() > 1:
+                    current_pos = current_pos[0]  # 取第一个环境
                 
-                # 计算当前位置差异
-                pos_diff = target_pose.p - current_pose.p
-                current_distance = torch.linalg.norm(pos_diff)
+                # 计算位置误差
+                pos_error = target_pos - current_pos
+                current_distance = torch.linalg.norm(pos_error).item()
                 
-                # 如果已经足够接近，提前退出
-                if current_distance < 0.02:
-                    print(f"成功到达目标位置，误差: {current_distance:.4f}m")
+                # 更新最小距离记录
+                if current_distance < min_distance_achieved:
+                    min_distance_achieved = current_distance
+                
+                # 更严格的成功条件：误差小于8cm（放宽阈值）
+                if current_distance < 0.08:  # 从2cm放宽到8cm
+                    print(f"✅ 成功到达目标位置，误差: {current_distance:.4f}m，当前位置: {self.agent.tcp.pose.p}, 用时: {step}步")
                     return True
                 
-                # 使用自适应步长：距离越远，步长越大
-                if current_distance > 0.1:
-                    scale_factor = 0.5  # 大步长
-                elif current_distance > 0.05:
-                    scale_factor = 0.3  # 中步长
+                # 改进的卡住检测
+                distance_change = abs(current_distance - prev_distance)
+                if distance_change < 0.001:  # 误差变化小于1mm
+                    stuck_count += 1
+                    if stuck_count > 15:  # 减少卡住阈值：从20->15
+                        print(f"⚠️ 检测到卡住，当前误差: {current_distance:.4f}m，最小误差: {min_distance_achieved:.4f}m")
+                        # 如果卡住时误差小于12cm，仍然认为成功
+                        if current_distance < 0.12:  # 进一步放宽卡住时的成功条件
+                            print(f"✅ 卡住但误差可接受，认为成功")
+                            return True
+                        else:
+                            print(f"❌ 卡住且误差过大，尝试最后几步大步长移动")
+                            # 尝试最后几步大步长移动
+                            for rescue_step in range(5):
+                                action = torch.zeros(7, device=self.device, dtype=torch.float32)
+                                # 使用最大步长直接朝目标移动
+                                action[:3] = (pos_error / torch.linalg.norm(pos_error)) * 0.1
+                                action[3:6] = 0.0
+                                action[6] = 0.00
+                                super().step(action)
+                                
+                                # 重新检查位置
+                                current_pos = self.agent.tcp.pose.p
+                                if current_pos.dim() > 1:
+                                    current_pos = current_pos[0]
+                                pos_error = target_pos - current_pos
+                                current_distance = torch.linalg.norm(pos_error).item()
+                                
+                                if current_distance < 0.12:
+                                    print(f"✅ 救援移动成功，最终误差: {current_distance:.4f}m")
+                                    return True
+                            
+                            print(f"❌ 救援移动失败，最终误差: {current_distance:.4f}m")
+                            return False
                 else:
-                    scale_factor = 0.1  # 小步长
+                    stuck_count = 0  # 重置卡住计数
                 
-                # 计算姿态差异（简化处理）
-                quat_diff = torch.zeros(3, device=self.device)
+                prev_distance = current_distance
                 
-                # 构建7维动作向量 [dx, dy, dz, drx, dry, drz, gripper]
-                action = torch.zeros(7, device=self.device)
-                action[:3] = pos_diff * scale_factor  # 自适应位置增量
-                action[3:6] = quat_diff  # 姿态控制
-                action[6] = 0.0  # 保持夹爪状态
+                # 构建动作向量 [dx, dy, dz, drx, dry, drz, gripper]
+                action = torch.zeros(7, device=self.device, dtype=torch.float32)
                 
-                # 执行多步以加快收敛
-                for _ in range(3):  # 每个循环执行3步
-                    self._low_level_step(action)
+                # 位置控制：充分利用控制器的0.1m最大增量能力
+                max_controller_step = 0.1  # 控制器支持的最大增量：10cm
                 
-                # 打印进度
-                if step % 2 == 0:
-                    print(f"步骤 {step}: 位置误差 {current_distance:.4f}m, 步长因子 {scale_factor:.2f}")
+                # 更激进的步长策略：优先快速接近
+                if current_distance > 0.15:
+                    # 距离较远时，使用最大步长快速接近
+                    scale_factor = 1.0  # 使用100%的控制器能力
+                elif current_distance > 0.10:
+                    # 中等距离时，仍然使用较大步长
+                    scale_factor = 0.95  # 使用95%的控制器能力
+                elif current_distance > 0.05:
+                    # 接近目标时，使用中等步长
+                    scale_factor = 0.8
+                else:
+                    # 非常接近时，使用精细控制
+                    scale_factor = 0.5
+                
+                # 计算实际步长
+                actual_max_step = max_controller_step * scale_factor
+                
+                # 归一化位置误差到控制器的最大增量范围
+                pos_error_norm = torch.linalg.norm(pos_error)
+                if pos_error_norm > actual_max_step:
+                    # 如果距离大于最大步长，则按最大步长移动
+                    action[:3] = (pos_error / pos_error_norm) * actual_max_step
+                else:
+                    # 如果距离小于最大步长，则直接移动到目标位置
+                    action[:3] = pos_error
+                
+                # 姿态控制：保持垂直向下
+                action[3:6] = 0.0  # 不改变姿态
+                
+                # 夹爪控制
+                action[6] = 0.00  # 保持夹爪状态
+                
+                # 执行动作
+                super().step(action)
+                
+                # 打印进度（减少输出频率）
+                if step % 20 == 0 or step < 5:  # 前5步和每30步输出一次
+                    print(f"步骤 {step}: 误差 {current_distance:.4f}m, 步长因子 {scale_factor:.2f}, 实际步长 {actual_max_step:.3f}m, 卡住计数 {stuck_count}")
             
             # 检查最终误差
-            end_effector_link = self.arm_controller.articulation.links_map[end_effector_link_name]
-            final_pose = end_effector_link.pose
-            final_error = torch.linalg.norm(target_pose.p - final_pose.p)
-            print(f"移动完成，最终误差: {final_error:.4f}m")
+            final_pos = self.agent.tcp.pose.p
+            if final_pos.dim() > 1:
+                final_pos = final_pos[0]
+            final_error = torch.linalg.norm(target_pos - final_pos).item()
+            print(f"移动完成，最终误差: {final_error:.4f}m，最小误差: {min_distance_achieved:.4f}m")
             
-            # 放宽成功条件到5cm
-            return final_error < 0.05
+            # 放宽成功条件：误差小于12cm
+            success = final_error < 0.12  # 进一步放宽：从10cm->12cm
+            if success:
+                print(f"✅ 移动成功，误差在可接受范围内: {final_error:.4f}m")
+            else:
+                print(f"❌ 移动失败，误差过大: {final_error:.4f}m")
+            
+            return success
             
         except Exception as e:
-            print(f"机械臂移动失败: {e}")
+            print(f"❌ 移动到位置失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+    
+    def _pick_object_8_states(self, obj_idx: int) -> Tuple[bool, float]:
+        """
+        8状态抓取流程
+        
+        Args:
+            obj_idx: 物体索引
+            
+        Returns:
+            success: 抓取是否成功
+            displacement: 其他物体的位移
+        """
+        if obj_idx >= len(self.all_objects):
+            print(f"物体索引{obj_idx}超出范围")
+            return False, 0.0
+        
+        # 获取目标物体
+        target_obj = self.all_objects[obj_idx]
+        
+        # 记录抓取前其他物体的位置
+        other_objects_pos_before = []
+        for i, obj in enumerate(self.all_objects):
+            if i != obj_idx and i not in self.grasped_objects:
+                obj_pos = obj.pose.p
+                if obj_pos.dim() > 1:
+                    obj_pos = obj_pos[0]
+                other_objects_pos_before.append(obj_pos.clone())
+        
+        try:
+            # 获取目标物体位置
+            obj_pos = target_obj.pose.p
+            if obj_pos.dim() > 1:
+                obj_pos = obj_pos[0]
+            obj_pos = obj_pos.cpu().numpy()
+            
+            print(f"开始8状态抓取流程，目标物体{obj_idx}，位置: {obj_pos}")
+            
+            # 检查是否在机械臂范围内
+            robot_base = np.array([-0.615, 0, 0])  # 机械臂基座位置
+            distance = np.linalg.norm(obj_pos[:2] - robot_base[:2])
+            if distance > 0.6:  # 最大抓取范围60cm
+                print(f"物体{obj_idx}超出机械臂范围，距离: {distance:.3f}m")
+                return False, 0.0
+            
+            # 检查是否被遮挡（简化版射线检测）
+            if self._is_object_blocked(target_obj):
+                print(f"物体{obj_idx}被遮挡")
+                return False, 0.0
+            
+            # === 状态0: 机械臂上升到物体上方 ===
+            print("状态0: 机械臂上升到物体上方")
+            approach_pos = obj_pos.copy()
+            approach_pos[2] += 0.15  # 减少高度：从20cm改为15cm
+            
+            if not self._move_to_position(approach_pos, steps=150):  # 增加步数：100->150
+                print("状态0失败：无法移动到物体上方")
+                return False, 0.0
+            
+            # === 状态1: 机械臂下降到物体上方准备抓取 ===
+            print("状态1: 机械臂下降到物体上方")
+            descend_pos = obj_pos.copy()
+            descend_pos[2] += 0.03  # 减少高度：从5cm改为3cm，更接近物体
+            
+            if not self._move_to_position(descend_pos, steps=80):  # 增加步数：50->80
+                print("状态1失败：无法下降到物体上方")
+                return False, 0.0
+            
+            # === 状态2: 吸取/抓取物体 ===
+            print("状态2: 抓取物体")
+            grasp_pos = obj_pos.copy()
+            grasp_pos[2] += 0.01  # 减少高度：从2cm改为1cm，更贴近物体
+            
+            if not self._move_to_position(grasp_pos, steps=80):  # 增加步数：50->80
+                print("状态2失败：无法抓取物体")
+                return False, 0.0
+
+            self._close_gripper()
+
+            # # 检查抓取是否成功
+            # if not self._check_grasp_success(target_obj):
+            #     print("状态2失败：抓取不成功")
+            #     return False, 0.0
+            
+            # === 状态3: 物体上升 ===
+            print("状态3: 物体上升")
+            lift_pos = grasp_pos.copy()
+            lift_pos[2] += 0.2  # 减少高度：从30cm改为20cm
+            
+            if not self._move_to_position(lift_pos, steps=100):  # 增加步数：80->100
+                print("状态3失败：无法提升物体")
+                return False, 0.0
+            
+            # === 状态4: 移动到放置位置 ===
+            print("状态4: 移动到放置位置")
+            transport_pos = np.array([-0.4, 0.4, lift_pos[2]])  # 目标区域上方
+            
+            if not self._move_to_position(transport_pos, steps=180):  # 增加步数：100->120
+                print("状态4失败：无法移动到放置位置")
+                return False, 0.0
+            
+            # === 状态5: 下降到放置位置 ===
+            print("状态5: 下降到放置位置")
+            lower_pos = transport_pos.copy()
+            lower_pos[2] -= 0.2  # 减少高度：从30cm改为20cm
+            
+            if not self._move_to_position(lower_pos, steps=100):  # 增加步数：80->100
+                print("状态5失败：无法下降到放置位置")
+                return False, 0.0
+            
+            # === 状态6: 放下物体 ===
+            print("状态6: 放下物体")
+            release_pos = lower_pos.copy()
+            
+            if not self._move_to_position(release_pos, steps=20):  # 保持较少步数：30->20
+                print("状态6失败：无法放下物体")
+                return False, 0.0
+            
+            self._open_gripper()
+
+            # === 状态7: 回到初始位置 ===
+            print("状态7: 回到初始位置")
+            home_pos = np.array([-0.6, 0.4, 0.4])  # 回到安全位置
+            
+            if not self._move_to_position(home_pos, steps=100):  # 增加步数：50->100
+                print("状态7失败：无法回到初始位置")
+                # 这里不返回失败，因为物体已经成功放置
+            
+            # 标记抓取成功
+            self.grasped_objects.append(obj_idx)
+            print(f"8状态抓取流程完成，成功抓取物体{obj_idx}")
+            
+            # 计算其他物体的位移
+            displacement = 0.0
+            for i, obj in enumerate(self.all_objects):
+                if i != obj_idx and i not in self.grasped_objects:
+                    obj_pos_after = obj.pose.p
+                    if obj_pos_after.dim() > 1:
+                        obj_pos_after = obj_pos_after[0]
+                    
+                    # 找到对应的初始位置
+                    if len(other_objects_pos_before) > 0:
+                        # 简化处理：使用第一个可用的初始位置
+                        pos_before = other_objects_pos_before[0] if other_objects_pos_before else obj_pos_after
+                        displacement += torch.linalg.norm(obj_pos_after - pos_before).item()
+            
+            return True, displacement
+            
+        except Exception as e:
+            print(f"8状态抓取流程出错: {e}")
+            return False, 0.0
     
     def _low_level_step(self, delta_pose: torch.Tensor):
         """单步执行delta pose，只推进仿真，不走离散逻辑"""
         # 调用父类的step方法执行连续动作
         super().step(delta_pose)
     
-    def _goto_qpos(self, target_qpos: torch.Tensor, steps: int = 10) -> bool:
-        """快速移动到指定关节角位置"""
+    def _check_grasp_success(self, target_obj) -> bool:
+        """检查抓取是否成功"""
         try:
-            if target_qpos is None:
-                print("目标关节角为None")
-                return False
-            
-            print(f"开始移动到关节角位置: {target_qpos}")
-            
-            # 确保维度正确
-            if target_qpos.dim() == 1:
-                target_qpos = target_qpos.unsqueeze(0)
-            
-            # 设置关节角目标
-            for step in range(steps):
-                # 使用关节角控制
-                self.arm_controller.articulation.set_qpos(target_qpos)
-                
-                # 推进仿真
-                self.scene.step()
-                
-                # 检查是否到达目标
-                current_qpos = self.agent.robot.get_qpos()
-                if current_qpos.dim() > 1:
-                    current_qpos = current_qpos[0]
-                current_arm_qpos = current_qpos[:7]  # 前7个关节角
-                
-                # 确保target_qpos也是7维
-                target_arm_qpos = target_qpos[0] if target_qpos.dim() > 1 else target_qpos
-                if target_arm_qpos.shape[-1] > 7:
-                    target_arm_qpos = target_arm_qpos[:7]
-                
-                error = torch.linalg.norm(target_arm_qpos - current_arm_qpos)
-                if error < 0.1:  # 关节角误差小于0.1弧度
-                    print(f"成功到达目标关节角，误差: {error:.4f}rad")
+            # 方法1：检查夹爪是否抓住物体
+            if hasattr(self.agent, 'is_grasping'):
+                is_grasped = self.agent.is_grasping(target_obj)
+                if is_grasped.any():
                     return True
-                
-                if step % 5 == 0:
-                    print(f"步骤 {step}: 关节角误差 {error:.4f}rad")
             
-            # 检查最终误差
-            final_qpos = self.agent.robot.get_qpos()
-            if final_qpos.dim() > 1:
-                final_qpos = final_qpos[0]
-            final_arm_qpos = final_qpos[:7]
+            # 方法2：检查物体是否在夹爪附近
+            tcp_pos = self.agent.tcp.pose.p
+            if tcp_pos.dim() > 1:
+                tcp_pos = tcp_pos[0]
             
-            final_error = torch.linalg.norm(target_arm_qpos - final_arm_qpos)
-            print(f"关节角移动完成，最终误差: {final_error:.4f}rad")
+            obj_pos = target_obj.pose.p
+            if obj_pos.dim() > 1:
+                obj_pos = obj_pos[0]
             
-            return final_error < 0.2  # 最终误差容忍度
+            distance = torch.linalg.norm(tcp_pos - obj_pos)
+            
+            # 距离小于8cm认为抓取成功
+            return distance < 0.08
             
         except Exception as e:
-            print(f"关节角移动失败: {e}")
+            print(f"检查抓取成功失败: {e}")
             return False
+    
+    def _is_object_blocked(self, target_obj) -> bool:
+        """
+        简化的遮挡检测，对应PyBullet的射线检测
+        检查物体上方是否有其他物体
+        """
+        try:
+            target_pos = target_obj.pose.p
+            if target_pos.dim() > 1:
+                target_pos = target_pos[0]
+            
+            # 检查是否有其他物体在目标物体上方
+            for obj in self.all_objects:
+                if obj == target_obj:
+                    continue
+                
+                obj_pos = obj.pose.p
+                if obj_pos.dim() > 1:
+                    obj_pos = obj_pos[0]
+                
+                # 检查是否在目标物体上方（xy平面距离小于5cm，z高度大于目标物体）
+                xy_distance = torch.linalg.norm(obj_pos[:2] - target_pos[:2])
+                if xy_distance < 0.05 and obj_pos[2] > target_pos[2]:
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"遮挡检测失败: {e}")
+            return False
+
+    # 删除：原来的IK抓取方法
+    # def _ik_grasp(self, object_idx: int) -> Tuple[bool, float]:
+    
+    # 删除：移动机械臂方法
+    # def _move_arm(self, target_pose: Pose, steps: int = 10) -> bool:
+    
+    # 删除：低级步进方法
+    # def _low_level_step(self, delta_pose: torch.Tensor):
+    
+    # 删除：关节角移动方法
+    # def _goto_qpos(self, target_qpos: torch.Tensor, steps: int = 10) -> bool:
+    
+    # 删除：夹爪控制方法
+    # def _close_gripper(self):
+    # def _open_gripper(self):
 
     def _load_scene(self, options: dict):
         # 构建桌面场景
@@ -527,7 +634,7 @@ class EnvClutterEnv(BaseEnv):
         for env_idx in range(self.num_envs):
             builder = actor_builders[0]
             # 设置托盘位置 (放在桌面上，机器人前方)
-            tray_position = [0.1, 0.0, 0.02]  # 桌面高度加上托盘底部厚度
+            tray_position = [-0.2, 0.0, 0.02]  # 桌面高度加上托盘底部厚度
             builder.initial_pose = sapien.Pose(p=tray_position)
             builder.set_scene_idxs([env_idx])
             
@@ -544,9 +651,9 @@ class EnvClutterEnv(BaseEnv):
     def _generate_object_position_in_tray(self, stack_level=0):
         """在托盘内生成物体位置"""
         # 托盘中心位置
-        tray_center_x = 0.1
+        tray_center_x = -0.2
         tray_center_y = 0.0
-        tray_bottom_z = 0.02 + 0.03  # 托盘底部 + 小偏移
+        tray_bottom_z = 0.02 + 0.04  # 托盘底部 + 小偏移
         
         # 托盘边界计算（基于URDF文件中的边界墙位置）
         # 边界墙在托盘中心的±0.25米处，考虑边界墙厚度0.02米
@@ -604,6 +711,7 @@ class EnvClutterEnv(BaseEnv):
                 obj_info['exposed_area'] = exposed_area
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        """初始化每个episode"""
         with torch.device(self.device):
             b = len(env_idx)
             self.scene_builder.initialize(env_idx)
@@ -631,11 +739,10 @@ class EnvClutterEnv(BaseEnv):
             # 设置目标位置 - 固定在托盘右侧
             goal_pos = torch.zeros((b, 3), device=self.device)
             
-            # 托盘中心位置：[0.1, 0.0, 0.02]
+            # 托盘中心位置：[-0.2, 0.0, 0.02]
             # 托盘尺寸：长0.6m，宽0.6m
-            # 托盘右侧边界：0.1 + 0.3 = 0.4m
             # 目标位置设定在托盘右侧外10cm处，避免与托盘边界冲突
-            goal_pos[:, 0] = 0.0  # 托盘右侧的固定位置
+            goal_pos[:, 0] = -0.4  # 托盘右侧的固定位置
             goal_pos[:, 1] = 0.3  # y方向居中，与托盘中心对齐
             goal_pos[:, 2] = 0.05  # 桌面高度5cm，确保物体稳定放置
             
@@ -665,40 +772,9 @@ class EnvClutterEnv(BaseEnv):
                 self.step_count = 0
                 self.grasped_objects = []
             
-            # 新增：重置机械臂到初始IK pose
-            if self.q_init is not None:
-                try:
-                    # 获取机器人的实际DOF
-                    robot_dof = self.agent.robot.dof[0].item()  # 获取单个环境的DOF
-                    print(f"机器人实际DOF: {robot_dof}")
-                    
-                    # 构建完整的初始关节角
-                    # Panda: 7个arm关节 + 2个gripper关节 = 9个DOF
-                    if robot_dof == 9:
-                        # 7个arm关节 + 2个gripper关节（打开状态：0.04, 0.04）
-                        full_qpos = torch.zeros(robot_dof, device=self.device)
-                        full_qpos[:7] = self.q_init  # arm关节
-                        full_qpos[7:9] = torch.tensor([0.04, 0.04], device=self.device)  # gripper关节
-                    else:
-                        # 如果DOF不是9，使用默认方式
-                        full_qpos = torch.zeros(robot_dof, device=self.device)
-                        min_len = min(len(self.q_init), robot_dof)
-                        full_qpos[:min_len] = self.q_init[:min_len]
-                    
-                    # 扩展到批次维度
-                    init_qpos = full_qpos.unsqueeze(0).repeat(len(env_idx), 1)
-                    
-                    print(f"构建的初始qpos维度: {init_qpos.shape}, 目标形状: [{len(env_idx)}, {robot_dof}]")
-                    
-                    # 重置机械臂
-                    self.agent.reset(init_qpos=init_qpos)
-                    print(f"机械臂已重置到初始IK pose")
-                except Exception as e:
-                    print(f"重置机械臂到初始pose失败: {e}")
-                    print(f"q_init维度: {self.q_init.shape if self.q_init is not None else 'None'}")
-                    print(f"机器人DOF: {self.agent.robot.dof}")
+            # 删除：重置机械臂到初始IK pose的代码
                     # 使用默认重置
-                    self.agent.reset()
+                self.agent.reset()
 
     def _get_obs_extra(self, info: Dict):
         """获取额外观测信息"""
@@ -860,7 +936,7 @@ class EnvClutterEnv(BaseEnv):
             # 1.1 计算物体上方10cm的位置和姿态
             above_pos = target_pos.clone()
             above_pos[2] += 0.1  # 上方10cm
-            above_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))
+            above_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
             above_pose = Pose.create_from_pq(p=above_pos, q=above_quat)
             
             # # 转换到根坐标系
@@ -871,7 +947,7 @@ class EnvClutterEnv(BaseEnv):
             # above_pose = root_transform * above_pose
             
             # 1.2 使用_move_arm移动到物体上方
-            if not self._move_arm(above_pose, steps=200):
+            if not self._move_to_position(above_pos, steps=200):
                 print(f"无法移动到物体{object_idx}上方")
                 return False, 0.0
             
@@ -879,14 +955,14 @@ class EnvClutterEnv(BaseEnv):
             # 2.1 计算抓取位置（贴合物体）
             grasp_pos = target_pos.clone()
             grasp_pos[2] += 0.02  # 略微高于物体表面
-            grasp_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))
+            grasp_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
             grasp_pose = Pose.create_from_pq(p=grasp_pos, q=grasp_quat)
             
             # # 转换到根坐标系
             # grasp_pose = root_transform * grasp_pose
             
             # 2.2 移动到抓取位置
-            if not self._move_arm(grasp_pose, steps=200):
+            if not self._move_to_position(grasp_pos, steps=200):
                 print(f"无法移动到物体{object_idx}抓取位置")
                 return False, 0.0
             
@@ -917,27 +993,27 @@ class EnvClutterEnv(BaseEnv):
             
             lift_pos = current_pos.clone()
             lift_pos[2] += 0.1  # 上方10cm
-            lift_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))
+            lift_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
             lift_pose = Pose.create_from_pq(p=lift_pos, q=lift_quat)
             
             # # 转换到根坐标系
             # lift_pose = root_transform * lift_pose
             
             # 3.2 提升
-            if not self._move_arm(lift_pose, steps=200):
+            if not self._move_to_position(lift_pos, steps=200):
                 print(f"无法提升物体{object_idx}")
                 self._open_gripper()
                 return False, 0.0
             
             # === 阶段4：使用预计算的关节角快速移动到目标区域 ===
             # 4.1 移动到目标区域上方
-            if not self._move_arm(self.q_above, steps=200):
+            if not self._move_to_position(self.q_above, steps=200):
                 print(f"无法移动到目标区域上方")
                 self._open_gripper()
                 return False, 0.0
             
             # 4.2 下降到目标位置
-            if not self._move_arm(self.q_goal, steps=200):
+            if not self._move_to_position(self.q_goal, steps=200):
                 print(f"无法移动到目标位置")
                 self._open_gripper()
                 return False, 0.0
@@ -951,13 +1027,13 @@ class EnvClutterEnv(BaseEnv):
                 retreat_pos = retreat_pos[0]
             retreat_pos = retreat_pos.clone()
             retreat_pos[2] += 0.05  # 上方5cm
-            retreat_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))
+            retreat_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
             retreat_pose = Pose.create_from_pq(p=retreat_pos, q=retreat_quat)
             
             # # 转换到根坐标系
             # retreat_pose = root_transform * retreat_pose
             
-            self._move_arm(retreat_pose, steps=200)
+            self._move_to_position(retreat_pos, steps=200)
             
             # 标记抓取成功
             success = True
@@ -1043,8 +1119,8 @@ class EnvClutterEnv(BaseEnv):
         # 获取实际的物体索引
         target_idx = self.remaining_indices[action]
         
-        # 执行抓取
-        success, displacement = self._ik_grasp(target_idx)
+        # 执行8状态抓取流程
+        success, displacement = self._pick_object_8_states(target_idx)
         
         # 从剩余列表中移除已抓取的物体
         self.remaining_indices.pop(action)

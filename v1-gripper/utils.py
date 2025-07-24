@@ -437,44 +437,6 @@ def check_environment_setup():
         except ImportError:
             print(f"{dep}: 未安装")
 
-class CsvLogger:
-    """CSV日志记录器"""
-    def __init__(self, filepath: str):
-        self.filepath = Path(filepath)
-        self.filepath.parent.mkdir(parents=True, exist_ok=True)
-        self.header_written = False
-        
-    def log(self, data: Dict[str, Any]):
-        """记录数据到CSV文件"""
-        # 确保数据中的值都是可序列化的
-        processed_data = {}
-        for key, value in data.items():
-            if isinstance(value, (np.ndarray, torch.Tensor)):
-                processed_data[key] = value.item() if value.size == 1 else value.mean().item()
-            elif isinstance(value, (np.integer, np.floating)):
-                processed_data[key] = value.item()
-            else:
-                processed_data[key] = value
-        
-        # 写入CSV文件
-        import csv
-        file_exists = self.filepath.exists()
-        
-        with open(self.filepath, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=processed_data.keys())
-            
-            # 如果文件不存在或者还没写过表头，写入表头
-            if not file_exists or not self.header_written:
-                writer.writeheader()
-                self.header_written = True
-            
-            writer.writerow(processed_data)
-    
-    def log_list(self, data_list: List[Dict[str, Any]]):
-        """批量记录数据列表到CSV文件"""
-        for data in data_list:
-            self.log(data)
-
 if __name__ == "__main__":
     # 测试工具函数
     check_environment_setup()

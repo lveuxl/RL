@@ -23,9 +23,253 @@ from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 # 新增：IK和控制器相关导入
 from mani_skill.agents.controllers.pd_ee_pose import PDEEPoseController
 
+# 新增：运动规划器相关导入
+from motionplanner import PandaArmMotionPlanningSolver
+
+
+class MotionPlannerWrapper:
+    """运动规划辅助类，封装MPLib运动规划器的抓取逻辑"""
+    
+    def __init__(self, env, debug=False):
+        self.env = env
+        self.base_env = env.unwrapped
+        self.debug = debug
+        self.planner = None
+        self.initialized = False
+        
+    def initialize(self):
+        """初始化运动规划器"""
+        if not self.initialized:
+            try:
+                # 检查环境和agent是否准备就绪
+                if not hasattr(self.base_env, 'agent') or self.base_env.agent is None:
+                    print("环境agent未准备就绪，无法初始化运动规划器")
+                    return
+                
+                if not hasattr(self.base_env.agent, 'robot') or self.base_env.agent.robot is None:
+                    print("机器人未准备就绪，无法初始化运动规划器")
+                    return
+                
+                # 检查机器人关节状态
+                try:
+                    qpos = self.base_env.agent.robot.get_qpos()
+                    if qpos is None:
+                        print("机器人关节状态为None，无法初始化运动规划器")
+                        return
+                    print(f"机器人关节状态形状: {qpos.shape}")
+                except Exception as e:
+                    print(f"获取机器人关节状态失败: {e}")
+                    return
+                
+                self.planner = PandaArmMotionPlanningSolver(
+                    env=self.env,
+                    debug=self.debug,
+                    vis=False,  # 关闭可视化以提高速度
+                    visualize_target_grasp_pose=False,
+                    print_env_info=False,
+                    joint_vel_limits=0.9,
+                    joint_acc_limits=0.9,
+                    base_pose=sapien.Pose(p=[-0.615, 0, 0]),  # 提供机器人基座位姿
+                )
+                self.initialized = True
+                print("运动规划器初始化成功")
+            except Exception as e:
+                print(f"运动规划器初始化失败: {e}")
+                import traceback
+                traceback.print_exc()
+                self.initialized = False
+    
+    def plan_grasp_sequence(self, target_object_idx: int, goal_pos: torch.Tensor) -> Tuple[bool, float]:
+        """
+        执行完整的抓取序列：抓-提-放
+        
+        Args:
+            target_object_idx: 目标物体索引
+            goal_pos: 目标放置位置
+            
+        Returns:
+            success: 抓取是否成功
+            displacement: 其他物体的位移增量
+        """
+        if not self.initialized:
+            self.initialize()
+            
+        if not self.initialized or self.planner is None:
+            print("运动规划器未初始化，回退到原始IK方法")
+            return False, 0.0
+        
+        # 获取目标物体
+        if target_object_idx >= len(self.base_env.all_objects):
+            return False, 0.0
+        
+        target_obj = self.base_env.all_objects[target_object_idx]
+        
+        # 记录抓取前其他物体的位置
+        other_objects_pos_before = []
+        for i, obj in enumerate(self.base_env.all_objects):
+            if i != target_object_idx and i not in self.base_env.grasped_objects:
+                obj_pos = obj.pose.p
+                if obj_pos.dim() > 1:
+                    obj_pos = obj_pos[0]
+                other_objects_pos_before.append(obj_pos.clone())
+        
+        success = False
+        try:
+            # 获取目标物体位置
+            target_pos = target_obj.pose.p
+            if target_pos.dim() > 1:
+                target_pos = target_pos[0]
+            target_pos = target_pos.clone()
+            
+            # === 状态机执行抓取序列 ===
+            
+            # 状态0：移动到物体上方（安全高度）
+            above_pos = target_pos.clone()
+            above_pos[2] += 0.1  # 上方10cm
+            above_pos_np = above_pos.cpu().numpy()
+            if above_pos_np.ndim > 1:
+                above_pos_np = above_pos_np.flatten()
+            above_pose = sapien.Pose(p=above_pos_np, q=[1, 0, 0, 0])
+            
+            result = self.planner.move_to_pose_with_RRTConnect(above_pose, dry_run=False)
+            if result == -1:
+                print(f"无法移动到物体{target_object_idx}上方")
+                return False, 0.0
+            
+            # 状态1：下降到抓取位置
+            grasp_pos = target_pos.clone()
+            grasp_pos[2] += 0.03  # 略微高于物体表面
+            grasp_pos_np = grasp_pos.cpu().numpy()
+            if grasp_pos_np.ndim > 1:
+                grasp_pos_np = grasp_pos_np.flatten()
+            grasp_pose = sapien.Pose(p=grasp_pos_np, q=[1, 0, 0, 0])
+            
+            result = self.planner.move_to_pose_with_screw(grasp_pose, dry_run=False)
+            if result == -1:
+                print(f"无法移动到物体{target_object_idx}抓取位置")
+                return False, 0.0
+            
+            # 状态2：闭合夹爪
+            self.planner.close_gripper()
+            
+            # 检查是否成功抓取
+            tcp_pos = self.base_env.agent.tcp.pose.p
+            if tcp_pos.dim() > 1:
+                tcp_pos = tcp_pos[0]
+            
+            obj_pos = target_obj.pose.p
+            if obj_pos.dim() > 1:
+                obj_pos = obj_pos[0]
+            
+            tcp_to_obj_dist = torch.linalg.norm(tcp_pos - obj_pos)
+            
+            if tcp_to_obj_dist > 0.08:  # 8cm内认为抓取成功
+                print(f"抓取物体{target_object_idx}失败，距离过远: {tcp_to_obj_dist:.3f}m")
+                self.planner.open_gripper()
+                return False, 0.0
+            
+            # 状态3：提升到安全高度
+            lift_pos = grasp_pos.clone()
+            lift_pos[2] += 0.15  # 上方15cm
+            lift_pos_np = lift_pos.cpu().numpy()
+            if lift_pos_np.ndim > 1:
+                lift_pos_np = lift_pos_np.flatten()
+            lift_pose = sapien.Pose(p=lift_pos_np, q=[1, 0, 0, 0])
+            
+            result = self.planner.move_to_pose_with_screw(lift_pose, dry_run=False)
+            if result == -1:
+                print(f"无法提升物体{target_object_idx}")
+                self.planner.open_gripper()
+                return False, 0.0
+            
+            # 状态4：移动到目标区域上方
+            goal_above_pos = goal_pos.clone()
+            if goal_above_pos.dim() > 1:
+                goal_above_pos = goal_above_pos[0]
+            goal_above_pos[2] += 0.15  # 上方15cm
+            goal_above_pos_np = goal_above_pos.cpu().numpy()
+            if goal_above_pos_np.ndim > 1:
+                goal_above_pos_np = goal_above_pos_np.flatten()
+            goal_above_pose = sapien.Pose(p=goal_above_pos_np, q=[1, 0, 0, 0])
+            
+            result = self.planner.move_to_pose_with_RRTConnect(goal_above_pose, dry_run=False)
+            if result == -1:
+                print(f"无法移动到目标区域上方")
+                self.planner.open_gripper()
+                return False, 0.0
+            
+            # 状态5：下降到放置位置
+            goal_place_pos = goal_pos.clone()
+            if goal_place_pos.dim() > 1:
+                goal_place_pos = goal_place_pos[0]
+            goal_place_pos[2] += 0.05  # 目标位置上方5cm
+            goal_place_pos_np = goal_place_pos.cpu().numpy()
+            if goal_place_pos_np.ndim > 1:
+                goal_place_pos_np = goal_place_pos_np.flatten()
+            goal_place_pose = sapien.Pose(p=goal_place_pos_np, q=[1, 0, 0, 0])
+            
+            result = self.planner.move_to_pose_with_screw(goal_place_pose, dry_run=False)
+            if result == -1:
+                print(f"无法移动到目标放置位置")
+                self.planner.open_gripper()
+                return False, 0.0
+            
+            # 状态6：打开夹爪放置物体
+            self.planner.open_gripper()
+            
+            # 状态7：稍微后退到安全位置
+            retreat_pos = goal_place_pos.clone()
+            retreat_pos[2] += 0.10  # 上方10cm
+            retreat_pos_np = retreat_pos.cpu().numpy()
+            if retreat_pos_np.ndim > 1:
+                retreat_pos_np = retreat_pos_np.flatten()
+            retreat_pose = sapien.Pose(p=retreat_pos_np, q=[1, 0, 0, 0])
+            
+            self.planner.move_to_pose_with_screw(retreat_pose, dry_run=False)
+            
+            # 标记抓取成功
+            success = True
+            self.base_env.grasped_objects.append(target_object_idx)
+            
+            print(f"成功使用运动规划器抓取并放置物体{target_object_idx}")
+            
+        except Exception as e:
+            print(f"运动规划抓取过程中出现错误: {e}")
+            success = False
+            # 尝试打开夹爪
+            try:
+                if self.planner:
+                    self.planner.open_gripper()
+            except:
+                pass
+        
+        # 计算其他物体的位移
+        displacement = 0.0
+        other_objects_pos_after = []
+        for i, obj in enumerate(self.base_env.all_objects):
+            if i != target_object_idx and i not in self.base_env.grasped_objects:
+                obj_pos = obj.pose.p
+                if obj_pos.dim() > 1:
+                    obj_pos = obj_pos[0]
+                other_objects_pos_after.append(obj_pos.clone())
+        
+        # 计算位移增量
+        if len(other_objects_pos_before) == len(other_objects_pos_after):
+            for pos_before, pos_after in zip(other_objects_pos_before, other_objects_pos_after):
+                displacement += torch.linalg.norm(pos_after - pos_before).item()
+        
+        return success, displacement
+    
+    def close(self):
+        """清理资源"""
+        if self.planner:
+            self.planner.close()
+            self.planner = None
+        self.initialized = False
+
 
 @register_env(
-    "EnvClutter-v1",
+    "EnvClutter-v2",
     asset_download_ids=["ycb"],
     max_episode_steps=200,
 )
@@ -92,6 +336,10 @@ class EnvClutterEnv(BaseEnv):
         self.q_above = None  # 目标区域上方关节角
         self.q_goal = None  # 目标区域关节角
         
+        # 新增：运动规划器初始化
+        self.motion_planner = None  # 将在_load_agent后初始化
+        self.use_motion_planner = True  # 是否使用运动规划器
+        
         # 确保所有参数正确传递给父类
         super().__init__(
             *args,
@@ -142,6 +390,16 @@ class EnvClutterEnv(BaseEnv):
         
         # 新增：初始化控制器缓存
         self.arm_controller = self.agent.controller.controllers["arm"]
+        
+        # 新增：初始化运动规划器
+        if self.use_motion_planner:
+            try:
+                self.motion_planner = MotionPlannerWrapper(self, debug=False)
+                print("运动规划器包装器创建成功")
+            except Exception as e:
+                print(f"运动规划器包装器创建失败: {e}")
+                self.motion_planner = None
+                self.use_motion_planner = False
         
         # 预计算关节角
         self._precompute_joint_positions()
@@ -342,8 +600,8 @@ class EnvClutterEnv(BaseEnv):
                     self._low_level_step(action)
                 
                 # 打印进度
-                if step % 2 == 0:
-                    print(f"步骤 {step}: 位置误差 {current_distance:.4f}m, 步长因子 {scale_factor:.2f}")
+                # if step % 2 == 0:
+                #     print(f"步骤 {step}: 位置误差 {current_distance:.4f}m, 步长因子 {scale_factor:.2f}")
             
             # 检查最终误差
             end_effector_link = self.arm_controller.articulation.links_map[end_effector_link_name]
@@ -819,7 +1077,40 @@ class EnvClutterEnv(BaseEnv):
         
         return obs
 
-    def _ik_grasp(self, object_idx: int) -> Tuple[bool, float]:
+    def _plan_grasp(self, object_idx: int) -> Tuple[bool, float]:
+        """
+        使用运动规划器抓取指定物体（优先），如果失败则回退到IK方法
+        
+        Args:
+            object_idx: 物体索引
+            
+        Returns:
+            success: 抓取是否成功
+            displacement: 其他物体的位移增量
+        """
+        if object_idx >= len(self.all_objects):
+            return False, 0.0
+        
+        # 优先使用运动规划器
+        if self.use_motion_planner and self.motion_planner is not None:
+            try:
+                # 获取目标放置位置
+                goal_pos = self.goal_pos[0] if hasattr(self, 'goal_pos') and self.goal_pos is not None else torch.tensor([0.0, 0.3, 0.05], device=self.device)
+                
+                success, displacement = self.motion_planner.plan_grasp_sequence(object_idx, goal_pos)
+                
+                if success:
+                    print(f"运动规划器成功抓取物体{object_idx}")
+                    return success, displacement
+                else:
+                    print(f"运动规划器抓取物体{object_idx}失败，回退到IK方法")
+            except Exception as e:
+                print(f"运动规划器抓取过程中出现错误: {e}，回退到IK方法")
+        
+        # 回退到原始IK方法
+        return self._ik_grasp_fallback(object_idx)
+    
+    def _ik_grasp_fallback(self, object_idx: int) -> Tuple[bool, float]:
         """
         使用真实的IK+PD_EE_DELTA_POSE控制器抓取指定物体
         
@@ -860,7 +1151,7 @@ class EnvClutterEnv(BaseEnv):
             # 1.1 计算物体上方10cm的位置和姿态
             above_pos = target_pos.clone()
             above_pos[2] += 0.1  # 上方10cm
-            above_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))
+            above_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
             above_pose = Pose.create_from_pq(p=above_pos, q=above_quat)
             
             # # 转换到根坐标系
@@ -869,6 +1160,15 @@ class EnvClutterEnv(BaseEnv):
             #     raw_root_pose = raw_root_pose[0]
             # root_transform = Pose.create(raw_root_pose).inv()
             # above_pose = root_transform * above_pose
+            
+            # 选择：是否使用坐标系转换
+            USE_COORDINATE_TRANSFORM = False  # 设置为True可以启用坐标系转换
+            
+            if USE_COORDINATE_TRANSFORM:
+                above_pose = self._world_to_robot_frame(above_pose)
+                print("使用坐标系转换")
+            else:
+                print("直接使用世界坐标系")
             
             # 1.2 使用_move_arm移动到物体上方
             if not self._move_arm(above_pose, steps=200):
@@ -879,11 +1179,14 @@ class EnvClutterEnv(BaseEnv):
             # 2.1 计算抓取位置（贴合物体）
             grasp_pos = target_pos.clone()
             grasp_pos[2] += 0.02  # 略微高于物体表面
-            grasp_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))
+            grasp_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
             grasp_pose = Pose.create_from_pq(p=grasp_pos, q=grasp_quat)
             
             # # 转换到根坐标系
             # grasp_pose = root_transform * grasp_pose
+            
+            if USE_COORDINATE_TRANSFORM:
+                grasp_pose = self._world_to_robot_frame(grasp_pose)
             
             # 2.2 移动到抓取位置
             if not self._move_arm(grasp_pose, steps=200):
@@ -917,11 +1220,14 @@ class EnvClutterEnv(BaseEnv):
             
             lift_pos = current_pos.clone()
             lift_pos[2] += 0.1  # 上方10cm
-            lift_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))
+            lift_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
             lift_pose = Pose.create_from_pq(p=lift_pos, q=lift_quat)
             
             # # 转换到根坐标系
             # lift_pose = root_transform * lift_pose
+            
+            if USE_COORDINATE_TRANSFORM:
+                lift_pose = self._world_to_robot_frame(lift_pose)
             
             # 3.2 提升
             if not self._move_arm(lift_pose, steps=200):
@@ -951,11 +1257,14 @@ class EnvClutterEnv(BaseEnv):
                 retreat_pos = retreat_pos[0]
             retreat_pos = retreat_pos.clone()
             retreat_pos[2] += 0.05  # 上方5cm
-            retreat_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))
+            retreat_quat = self._rpy_to_quat(torch.tensor([0.0, np.pi/2, 0.0], device=self.device))  # 垂直向下
             retreat_pose = Pose.create_from_pq(p=retreat_pos, q=retreat_quat)
             
             # # 转换到根坐标系
             # retreat_pose = root_transform * retreat_pose
+            
+            if USE_COORDINATE_TRANSFORM:
+                retreat_pose = self._world_to_robot_frame(retreat_pose)
             
             self._move_arm(retreat_pose, steps=200)
             
@@ -963,10 +1272,10 @@ class EnvClutterEnv(BaseEnv):
             success = True
             self.grasped_objects.append(object_idx)
             
-            print(f"成功抓取并放置物体{object_idx}")
+            print(f"成功使用IK方法抓取并放置物体{object_idx}")
             
         except Exception as e:
-            print(f"抓取过程中出现错误: {e}")
+            print(f"IK抓取过程中出现错误: {e}")
             success = False
             # 尝试打开夹爪
             try:
@@ -1044,7 +1353,7 @@ class EnvClutterEnv(BaseEnv):
         target_idx = self.remaining_indices[action]
         
         # 执行抓取
-        success, displacement = self._ik_grasp(target_idx)
+        success, displacement = self._plan_grasp(target_idx)
         
         # 从剩余列表中移除已抓取的物体
         self.remaining_indices.pop(action)
@@ -1263,4 +1572,17 @@ class EnvClutterEnv(BaseEnv):
             # 使用我们的观测处理方法
             obs = self._get_obs_extra(eval_info)
         
-        return obs, info 
+        return obs, info
+    
+    def close(self):
+        """清理环境资源"""
+        # 清理运动规划器资源
+        if hasattr(self, 'motion_planner') and self.motion_planner is not None:
+            try:
+                self.motion_planner.close()
+                print("运动规划器资源已清理")
+            except Exception as e:
+                print(f"清理运动规划器资源时出错: {e}")
+        
+        # 调用父类的close方法
+        super().close() 

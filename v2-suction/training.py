@@ -12,6 +12,10 @@ from collections import deque
 import mani_skill.envs
 from env_clutter import EnvClutterEnv
 from utils import CsvLogger  # 导入CsvLogger
+# 新增：导入视频录制相关模块
+from mani_skill.utils.wrappers.record import RecordEpisode
+from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -300,12 +304,44 @@ def train_ppo(args):
     env = gym.make(
         "EnvClutter-v1",
         num_envs=args.num_envs,
-        obs_mode="state",
+        obs_mode="rgb" if args.record_video else "state",  # 录制视频时使用rgb模式
         control_mode="pd_ee_delta_pose",
         reward_mode="dense",
-        render_mode="human" if args.render else None,
+        render_mode="rgb_array" if args.record_video else ("human" if args.render else None),
         use_discrete_action=True,  # 启用离散动作
+        # 录制视频时增加传感器配置
+        **(dict(sensor_configs=dict(width=args.video_width, height=args.video_height)) if args.record_video else {})
     )
+    
+    # 新增：视频录制包装器
+    if args.record_video:
+        video_output_dir = os.path.join(args.log_dir, "training_videos")
+        os.makedirs(video_output_dir, exist_ok=True)
+        print(f"训练视频将保存到: {video_output_dir}")
+        
+        # 设置视频录制触发器：每隔指定间隔录制一次
+        def video_trigger(episode_count):
+            return episode_count % args.video_record_interval == 0
+        
+        env = RecordEpisode(
+            env,
+            output_dir=video_output_dir,
+            save_trajectory=args.save_trajectory,
+            save_video=True,
+            trajectory_name="training_trajectory",
+            max_steps_per_video=args.max_video_steps,
+            video_fps=args.video_fps,
+            render_substeps=True,  # 启用子步渲染以获得更流畅的视频
+            info_on_video=True,  # 在视频上显示信息
+            save_video_trigger=video_trigger,  # 使用触发器控制录制时机
+            avoid_overwriting_video=True,  # 避免覆盖已有视频
+        )
+        print("✓ 视频录制包装器添加成功")
+    
+    # 新增：向量化包装器（如果启用了视频录制）
+    if args.record_video:
+        env = ManiSkillVectorEnv(env, args.num_envs, ignore_terminations=False, record_metrics=True)
+        print("✓ 向量化包装器添加成功")
     
     # 获取状态和动作维度
     obs, _ = env.reset()
@@ -316,12 +352,15 @@ def train_ppo(args):
     if hasattr(env, 'discrete_action_space') and env.discrete_action_space is not None:
         action_dim = env.discrete_action_space.n
         print(f"使用离散动作空间，动作维度: {action_dim}")
+    elif hasattr(env.unwrapped, 'discrete_action_space') and env.unwrapped.discrete_action_space is not None:
+        action_dim = env.unwrapped.discrete_action_space.n
+        print(f"使用离散动作空间，动作维度: {action_dim}")
     else:
         action_dim = env.action_space.shape[0]
         print(f"使用连续动作空间，动作维度: {action_dim}")
     
     print(f"状态维度: {state_dim}, 动作维度: {action_dim}")
-    print(f"渲染模式: {'开启' if args.render else '关闭'}")
+    print(f"渲染模式: {'视频录制' if args.record_video else ('人类观察' if args.render else '关闭')}")
     
     # 创建智能体
     agent = PPOAgent(state_dim, action_dim)
@@ -365,7 +404,7 @@ def train_ppo(args):
             done = terminated or truncated
             
             # 渲染环境
-            if args.render:
+            if args.render and not args.record_video:  # 避免重复渲染
                 env.render()
                 time.sleep(0.01)
             
@@ -410,9 +449,9 @@ def train_ppo(args):
             obs = next_obs
             total_steps += 1
             
-            # 打印步骤信息
-            if args.render and step % 10 == 0:
-                print(f"步骤 {step}: 奖励={reward:.3f}, 成功={success}, 完成={done}")
+            # 打印步骤信息（录制视频时更详细）
+            if (args.render or args.record_video) and step % 10 == 0:
+                print(f"步骤 {step}: 动作={action}, 奖励={reward:.3f}, 成功={success}, 完成={done}")
             
             # 如果episode结束
             if done:
@@ -421,6 +460,10 @@ def train_ppo(args):
                 episode_count += 1
                 
                 print(f"Episode {episode_count} 结束: 奖励={episode_reward:.3f}, 成功={episode_success}")
+                
+                # 视频录制完成提示
+                if args.record_video and (episode_count - 1) % args.video_record_interval == 0:
+                    print(f"📹 Episode {episode_count} 的训练视频已录制完成")
                 
                 # 重置环境
                 obs, _ = env.reset()
@@ -445,6 +488,10 @@ def train_ppo(args):
             writer.add_scalar('Training/Actor_Loss', actor_loss, epoch)
             writer.add_scalar('Training/Critic_Loss', critic_loss, epoch)
             
+            # 新增：视频录制相关日志
+            if args.record_video:
+                writer.add_scalar('Training/Episodes_Recorded', episode_count // args.video_record_interval, epoch)
+            
             # CSV日志
             csv_logger.log({
                 'epoch': epoch,
@@ -454,15 +501,22 @@ def train_ppo(args):
                 'total_displacement': total_displacement,
                 'steps': total_steps,
                 'actor_loss': actor_loss,
-                'critic_loss': critic_loss
+                'critic_loss': critic_loss,
+                'video_recorded': args.record_video and (episode_count - 1) % args.video_record_interval == 0
             })
             
             if epoch % args.log_interval == 0:
-                print(f"Epoch {epoch}, "
-                      f"平均奖励: {avg_reward:.2f}, "
-                      f"成功率: {avg_success_rate:.2f}, "
-                      f"Actor损失: {actor_loss:.4f}, "
-                      f"Critic损失: {critic_loss:.4f}")
+                log_msg = (f"Epoch {epoch}, "
+                          f"平均奖励: {avg_reward:.2f}, "
+                          f"成功率: {avg_success_rate:.2f}, "
+                          f"Actor损失: {actor_loss:.4f}, "
+                          f"Critic损失: {critic_loss:.4f}")
+                
+                if args.record_video:
+                    recorded_episodes = episode_count // args.video_record_interval
+                    log_msg += f", 已录制视频: {recorded_episodes} 个episode"
+                
+                print(log_msg)
         
         # 保存模型
         if epoch % args.save_interval == 0:
@@ -483,11 +537,21 @@ def main():
     parser.add_argument('--epochs', type=int, default=1000, help='训练轮数')
     parser.add_argument('--steps_per_epoch', type=int, default=2048, help='每轮步数')
     parser.add_argument('--num_envs', type=int, default=1, help='并行环境数量')
-    parser.add_argument('--log_dir', type=str, default='./logs/env_clutter', help='日志目录')
+    parser.add_argument('--log_dir', type=str, default='./logs', help='日志目录')
     parser.add_argument('--model_dir', type=str, default='./models/env_clutter', help='模型保存目录')
     parser.add_argument('--log_interval', type=int, default=10, help='日志记录间隔')
     parser.add_argument('--save_interval', type=int, default=100, help='模型保存间隔')
     parser.add_argument('--render', action='store_true', help='是否渲染')
+    
+    # 新增：视频录制相关参数
+    parser.add_argument('--record_video', action='store_true', help='是否录制训练视频')
+    parser.add_argument('--save_trajectory', action='store_true', help='是否保存轨迹数据')
+    parser.add_argument('--video_record_interval', type=int, default=50, help='视频录制间隔（每多少个episode录制一次）')
+    parser.add_argument('--max_video_steps', type=int, default=1000, help='每个视频的最大步数')
+    parser.add_argument('--video_fps', type=int, default=30, help='视频帧率')
+    parser.add_argument('--video_width', type=int, default=256, help='视频宽度')
+    parser.add_argument('--video_height', type=int, default=256, help='视频高度')
+    parser.add_argument('--settle_steps', type=int, default=30, help='物体稳定等待步数（录制视频时）')
     
     args = parser.parse_args()
     

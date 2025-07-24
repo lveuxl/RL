@@ -506,6 +506,7 @@ if __name__ == "__main__":
         if evaluate:
             eval_output_dir = f"{os.path.dirname(checkpoint)}/test_videos"
         print(f"Saving eval trajectories/videos to {eval_output_dir}")
+        #每隔 save_train_video_freq 个阶段（每阶段 num_steps 步）保存一次训练视频。
         if save_train_video_freq is not None:
             save_video_trigger = lambda x: (x // num_steps) % save_train_video_freq == 0
             envs = RecordEpisode(

@@ -17,7 +17,7 @@ class EnvConfig:
     
     # 观测和控制模式
     obs_mode: str = "state"  # "state", "rgbd", "rgb"
-    control_mode: str = "pd_ee_pose"  # "pd_ee_pose", "pd_joint_delta_pos"
+    control_mode: str = "pd_ee_delta_pose"  # "pd_ee_delta_pose", "pd_joint_delta_pos"
     reward_mode: str = "dense"  # "dense", "sparse"
     
     # 机器人配置
