@@ -89,7 +89,7 @@ class BaseRealAgent:
 
     def reset(self, qpos: Array):
         """
-        Reset the agent to a given qpos. For real robots this function should move the robot at a safe and controlled speed to the given qpos and aim to reach it accurately.
+         the agent to a given qpos. For real robots this function should move the robot at a safe and controlled speed to the given qpos and aim to reach it accurately.
         Args:
             qpos: the qpos in radians to reset the agent to.
         """

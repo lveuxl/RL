@@ -1,0 +1,12 @@
+# ninja log v7
+1	16446	1755876589625686266	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/cylinder_query.o	ff0250db7bac0fc2
+1	16542	1755876589625686266	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/ball_query.o	78489351602fb238
+1	16629	1755876589625686266	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/bindings.o	5ace4eb14a7fdeae
+2	17182	1755876589626686440	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/group_points_gpu.o	e2284506cf9a7793
+1	17542	1755876589625686266	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/ball_query_gpu.o	b763549de89d1438
+2	18383	1755876589626686440	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/interpolate_gpu.o	1987fc7926145b78
+2	18420	1755876589626686440	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/cylinder_query_gpu.o	e027f0ec4bc3c7ec
+2	19060	1755876589626686440	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/interpolate.o	1a802edbe8bdae63
+2	19073	1755876589626686440	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/group_points.o	7f9e086fae0ee9ab
+3	19103	1755876589627686614	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/sampling_gpu.o	b0fbcce92e2699ec
+2	19172	1755876589626686440	/home/linux/jzh/anygrasp_sdk/pointnet2/build/temp.linux-x86_64-cpython-310/pointnet2/_ext_src/src/sampling.o	2fc4fe566f3a92ff

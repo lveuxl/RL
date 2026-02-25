@@ -6,6 +6,13 @@ import torch
 import cv2
 import random
 
+# 导入配置
+try:
+    from .config import Config, get_config
+except ImportError:
+    # 处理直接运行时的相对导入问题
+    from config import Config, get_config
+
 import mani_skill.envs.utils.randomization as randomization
 from mani_skill import ASSET_DIR
 from mani_skill.agents.robots import Fetch, Panda
@@ -52,28 +59,16 @@ class EnvClutterEnv(BaseEnv):
     SUPPORTED_ROBOTS = ["panda", "fetch"]
     agent: Union[Panda, Fetch]
     
-    # YCB物体
-    BOX_OBJECTS = [
-        #"003_cracker_box",          # 饼干盒
-        "004_sugar_box",            # 糖盒
-        "006_mustard_bottle",       # 芥末瓶
-        "008_pudding_box",      # 布丁盒
-        #"009_gelatin_box",          # 明胶盒
-        #"010_potted_meat_can",      # 罐装肉罐头
-    ]
-    
-    goal_thresh = 0.03  # 成功阈值
     # 托盘参数 (基于traybox.urdf的尺寸)
     tray_size = [0.6, 0.6, 0.15]  # 托盘内部尺寸 (长x宽x高)
     tray_spawn_area = [0.23, 0.23]  # 托盘内物体生成区域 (考虑边界墙和安全边距)
-    num_objects_per_type = 5  # 每种类型的物体数量
     
-    # 新增：离散动作相关常量
-    MAX_N = len(BOX_OBJECTS) * num_objects_per_type  # 最大物体数量
-    MAX_EPISODE_STEPS = 15  # 最大episode步数
+    # 注意：物体相关参数现在从config中动态获取
+    # BOX_OBJECTS, num_objects_per_type, MAX_N, MAX_EPISODE_STEPS 等
+    # 都在 __init__ 方法中从配置文件初始化
     
     # 新增：吸盘约束相关常量
-    SUCTION_DISTANCE_THRESHOLD = 0.1  # 吸盘激活距离阈值 (3cm)
+    SUCTION_DISTANCE_THRESHOLD = 0.15  # 吸盘激活距离阈值 从10cm增加到15cm
     SUCTION_STIFFNESS = 1e6  # 吸盘约束刚度
     SUCTION_DAMPING = 1e4    # 吸盘约束阻尼
     
@@ -84,30 +79,46 @@ class EnvClutterEnv(BaseEnv):
         robot_init_qpos_noise=0.02,
         num_envs=1,
         use_discrete_action=False,  # 新增：是否使用离散动作
+        config_preset="default",    # 新增：配置预设名称
+        custom_config=None,         # 新增：自定义配置对象
         **kwargs,
     ):
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.use_discrete_action = use_discrete_action
         
-        # 设置类属性到实例属性
-        self.MAX_N = len(self.BOX_OBJECTS) * self.num_objects_per_type  # 最大物体数量
-        self.MAX_EPISODE_STEPS = 15  # 最大episode步数
+        # 初始化配置
+        if custom_config is not None:
+            self.config = custom_config
+        else:
+            self.config = get_config(config_preset)
         
-        # 初始化离散动作相关变量
-        self.remaining_indices = []  # 剩余可抓取物体的索引
-        self.step_count = 0  # 当前步数
-        self.grasped_objects = []  # 已抓取的物体
+        # 从配置中获取物体相关参数
+        self.BOX_OBJECTS = self.config.env.box_objects
+        self.num_objects_per_type = self.config.env.num_objects_per_type
+        self.num_object_types = self.config.env.num_object_types
+        self.total_objects_per_env = self.config.env.total_objects_per_env
+        self.goal_thresh = self.config.env.goal_thresh  # 成功阈值
+        
+        # 设置动态计算的属性
+        self.MAX_N = self.total_objects_per_env  # 最大物体数量
+        self.MAX_EPISODE_STEPS = self.config.env.max_episode_steps_discrete  # 最大episode步数
+        
+        # 初始化离散动作相关变量 - 修改为多环境支持
+        self.remaining_indices = []  # 每个环境的剩余可抓取物体索引 [[env0_indices], [env1_indices], ...]
+        self.step_count = []  # 每个环境的当前步数 [env0_steps, env1_steps, ...]
+        self.grasped_objects = []  # 每个环境已抓取的物体 [[env0_grasped], [env1_grasped], ...]
+        
+        # 新增：并行有限状态机变量
+        self.env_stage = None      # [num_envs] 当前所处状态 0~7
+        self.env_target = None     # [num_envs] 每个环境正在处理的物体索引
+        self.env_busy = None       # [num_envs] True=流程进行中，False=本回合已结束或等待新指令
+        self.stage_tick = None     # [num_envs] 在某状态中已经走了多少微步
+        self.stage_positions = None # [num_envs, 3] 每个环境当前状态的目标位置
         
         # 新增：初始化吸盘约束相关变量
         self.suction_constraints = {}  # 存储约束对象的字典 {object_name: constraint}
-        self.is_suction_active = False  # 吸盘是否激活
-        self.current_suction_object = None  # 当前吸附的物体
-        
-        # 删除：控制器和IK相关变量
-        # self.arm_controller = None  # 将在_load_agent后初始化
-        # self.q_init = None  # 初始关节角
-        # self.q_above = None  # 目标区域上方关节角
-        # self.q_goal = None  # 目标区域关节角
+        self.is_suction_active = [False] * num_envs  # 每个环境的吸盘激活状态
+        self.current_suction_object = [None] * num_envs  # 每个环境当前吸附的物体
         
         # 确保所有参数正确传递给父类
         super().__init__(
@@ -116,6 +127,10 @@ class EnvClutterEnv(BaseEnv):
             num_envs=num_envs,
             **kwargs,
         )
+        
+        # 在父类初始化后初始化FSM状态张量
+        if self.use_discrete_action:
+            self._init_fsm_states()
 
     @property
     def _default_sim_config(self):
@@ -157,551 +172,301 @@ class EnvClutterEnv(BaseEnv):
     def _load_agent(self, options: dict):
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
         
-        
-    
-    def _move_to_position(self, target_pos: np.ndarray, steps: int = 200) -> bool:
-        """
-        逆运动学控制，使用pd_ee_delta_pose控制模式移动到目标位置
-        
-        Args:
-            target_pos: 目标位置 [x, y, z]
-            steps: 执行步数
-            
-        Returns:
-            success: 是否成功到达目标位置
-        """
-        try:
-            #print(f"开始移动到位置: {target_pos}, 步数: {steps}")
-            
-            # 转换为torch tensor
-            if isinstance(target_pos, np.ndarray):
-                target_pos = torch.tensor(target_pos, device=self.device, dtype=torch.float32)
-            elif not isinstance(target_pos, torch.Tensor):
-                target_pos = torch.tensor(target_pos, device=self.device, dtype=torch.float32)
-            
-            # 记录上一次的误差，用于检测收敛
-            prev_distance = float('inf')
-            stuck_count = 0  # 连续卡住的次数
-            min_distance_achieved = float('inf')  # 记录达到的最小距离
-            
-            # 执行多步控制以到达目标位置
-            for step in range(steps):
-                # 获取当前末端执行器位置
-                current_pos = self.agent.tcp.pose.p
-                if current_pos.dim() > 1:
-                    current_pos = current_pos[0]  # 取第一个环境
-                
-                # 计算位置误差
-                pos_error = target_pos - current_pos
-                current_distance = torch.linalg.norm(pos_error).item()
-                
-                # 更新最小距离记录
-                if current_distance < min_distance_achieved:
-                    min_distance_achieved = current_distance
-                
-                # 更严格的成功条件：误差小于2cm
-                if current_distance < 0.02:  
-                    #print(f"✅ 成功到达目标位置，误差: {current_distance:.4f}m，当前位置: {self.agent.tcp.pose.p}, 用时: {step}步")
-                    return True
-                
-                # 改进的卡住检测
-                distance_change = abs(current_distance - prev_distance)
-                if distance_change < 0.001:  # 误差变化小于1mm
-                    stuck_count += 1
-                    if stuck_count > 15:  # 减少卡住阈值：从20->15
-                        #print(f"⚠️ 检测到卡住，当前误差: {current_distance:.4f}m，最小误差: {min_distance_achieved:.4f}m")
-                        # 如果卡住时误差小于12cm，仍然认为成功
-                        if current_distance < 0.12:  # 进一步放宽卡住时的成功条件
-                            #print(f"✅ 卡住但误差可接受，认为成功")
-                            return True
-                        else:
-                            #print(f"❌ 卡住且误差过大，尝试最后几步大步长移动")
-                            # 尝试最后几步大步长移动
-                            for rescue_step in range(5):
-                                action = torch.zeros(7, device=self.device, dtype=torch.float32)
-                                # 使用最大步长直接朝目标移动
-                                action[:3] = (pos_error / torch.linalg.norm(pos_error)) * 0.1
-                                action[3:6] = 0.0
-                                action[6] = 0.00
-                                super().step(action)
-                                
-                                # 重新检查位置
-                                current_pos = self.agent.tcp.pose.p
-                                if current_pos.dim() > 1:
-                                    current_pos = current_pos[0]
-                                pos_error = target_pos - current_pos
-                                current_distance = torch.linalg.norm(pos_error).item()
-                                
-                                if current_distance < 0.12:
-                                    #print(f"✅ 救援移动成功，最终误差: {current_distance:.4f}m")
-                                    return True
-                            
-                            #print(f"❌ 救援移动失败，最终误差: {current_distance:.4f}m")
-                            return False
-                else:
-                    stuck_count = 0  # 重置卡住计数
-                
-                prev_distance = current_distance
-                
-                # 构建动作向量 [dx, dy, dz, drx, dry, drz, gripper]
-                action = torch.zeros(7, device=self.device, dtype=torch.float32)
-                
-                # 位置控制：充分利用控制器的0.1m最大增量能力
-                max_controller_step = 0.1  # 控制器支持的最大增量：10cm
-                
-                # 更激进的步长策略：优先快速接近
-                if current_distance > 0.15:
-                    # 距离较远时，使用最大步长快速接近
-                    scale_factor = 1.0  # 使用100%的控制器能力
-                elif current_distance > 0.10:
-                    # 中等距离时，仍然使用较大步长
-                    scale_factor = 0.95  # 使用95%的控制器能力
-                elif current_distance > 0.05:
-                    # 接近目标时，使用中等步长
-                    scale_factor = 0.8
-                else:
-                    # 非常接近时，使用精细控制
-                    scale_factor = 0.5
-                
-                # 计算实际步长
-                actual_max_step = max_controller_step * scale_factor
-                
-                # 归一化位置误差到控制器的最大增量范围
-                pos_error_norm = torch.linalg.norm(pos_error)
-                if pos_error_norm > actual_max_step:
-                    # 如果距离大于最大步长，则按最大步长移动
-                    action[:3] = (pos_error / pos_error_norm) * actual_max_step
-                else:
-                    # 如果距离小于最大步长，则直接移动到目标位置
-                    action[:3] = pos_error
-                
-                # 姿态控制：保持垂直向下
-                action[3:6] = 0.0  # 不改变姿态
-                
-                # 夹爪控制
-                action[6] = 0.00  # 保持夹爪状态
-                
-                # 执行动作
-                super().step(action)
-                
-                # 打印进度（减少输出频率）
-                #if step % 20 == 0 or step < 5:  # 前5步和每30步输出一次
-                    #print(f"步骤 {step}: 误差 {current_distance:.4f}m, 步长因子 {scale_factor:.2f}, 实际步长 {actual_max_step:.3f}m, 卡住计数 {stuck_count}")
-            
-            # 检查最终误差
-            final_pos = self.agent.tcp.pose.p
-            if final_pos.dim() > 1:
-                final_pos = final_pos[0]
-            final_error = torch.linalg.norm(target_pos - final_pos).item()
-            #print(f"移动完成，最终误差: {final_error:.4f}m，最小误差: {min_distance_achieved:.4f}m")
-            
-            # 放宽成功条件：误差小于12cm
-            success = final_error < 0.12  # 进一步放宽：从10cm->12cm
-            if success:
-                #print(f"✅ 移动成功，误差在可接受范围内: {final_error:.4f}m")
-                pass
-            else:
-                #print(f"❌ 移动失败，误差过大: {final_error:.4f}m")
-                pass
-            
-            return success
-            
-        except Exception as e:
-            #print(f"❌ 移动到位置失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    # 新增：吸盘约束系统实现
-    def _create_suction_constraint(self, target_object: Actor) -> bool:
+    # 吸盘约束系统实现
+    def _create_suction_constraint(self, target_object: Actor, env_idx: int = 0) -> bool:
         """
         创建吸盘约束
         
         Args:
             target_object: 目标物体
+            env_idx: 环境索引（多环境支持）
             
         Returns:
             bool: 是否成功创建约束
         """
-        if self.is_suction_active:
-            #print("吸盘已经激活，无法创建新约束")
+        if self.is_suction_active[env_idx]:
+            print(f"环境{env_idx}: 吸盘已经激活，无法创建新约束")
             return False
             
         # 检查是否与物体接触
-        if not self._is_contacting_object(target_object, self.SUCTION_DISTANCE_THRESHOLD):
-            #print(f"物体距离过远，无法激活吸盘")
+        if not self._is_contacting_object(target_object, self.SUCTION_DISTANCE_THRESHOLD, env_idx):
+            print(f"环境{env_idx}: 物体距离过远，无法激活吸盘")
             return False
         
         try:
             # 导入Drive类
             from mani_skill.utils.structs.drive import Drive
             
-            #print(f"创建吸盘约束: TCP链接 -> 物体 {target_object.name}")
-            #print(f"TCP类型: {type(self.agent.tcp)}, 目标物体类型: {type(target_object)}")
+            print(f"环境{env_idx}: 创建吸盘约束: TCP链接 -> 物体 {target_object.name}")
             
-            # 使用Drive.create_from_actors_or_links方法创建约束
-            # 这个方法会正确处理Link和Actor对象的entity获取
-            constraint = Drive.create_from_actors_or_links(
-                scene=self.scene,
-                entities0=self.agent.tcp,     # TCP是Link对象
-                pose0=sapien.Pose(),          # 父体本地姿态
-                entities1=target_object,      # 目标物体是Actor对象
-                pose1=sapien.Pose(),          # 子体本地姿态
-                scene_idxs=torch.tensor([0], device=self.device)  # 场景索引
+            # 🔧 修复：安全的多环境对象选择
+            # 1. 验证目标物体的环境归属
+            target_scene_idxs = target_object._scene_idxs
+            if len(target_scene_idxs) == 0:
+                print(f"环境{env_idx}: 目标物体没有场景索引")
+                return False
+            
+            target_env_idx = target_scene_idxs[0].item()
+            print(f"环境{env_idx}: 目标物体实际属于环境{target_env_idx}")
+            
+            # 验证环境索引一致性
+            if target_env_idx != env_idx:
+                print(f"环境{env_idx}: 环境索引不匹配，目标物体属于环境{target_env_idx}")
+                return False
+            
+            # 2. 🔧 修复：通过scene_idxs安全获取TCP实体
+            tcp_objs = self.agent.tcp._objs
+            tcp_scene_idxs = self.agent.tcp._scene_idxs
+            
+            # 找到属于target_env_idx环境的TCP对象
+            tcp_mask = (tcp_scene_idxs == target_env_idx)
+            if not tcp_mask.any():
+                print(f"环境{env_idx}: 找不到对应环境的TCP对象")
+                return False
+            
+            tcp_indices = torch.where(tcp_mask)[0]
+            if len(tcp_indices) == 0:
+                print(f"环境{env_idx}: TCP索引列表为空")
+                return False
+                
+            tcp_idx = tcp_indices[0].item()  # 获取第一个匹配的索引
+            tcp_entity = tcp_objs[tcp_idx].entity
+            print(f"环境{env_idx}: 找到TCP对象，索引={tcp_idx}，环境={target_env_idx}")
+            
+            # 3. 🔧 修复：安全获取目标物体实体
+            if len(target_object._objs) == 0:
+                print(f"环境{env_idx}: 目标物体没有实体对象")
+                return False
+            
+            # 在当前设计中，每个物体通常只有一个实体
+            target_entity = target_object._objs[0]
+            print(f"环境{env_idx}: 目标物体实体数量={len(target_object._objs)}")
+            
+            print(f"环境{env_idx}: 使用TCP实体[索引{tcp_idx}]和目标实体创建约束")
+            
+            # 关键修复：直接使用SAPIEN的create_drive方法，绕过Drive包装器的批量处理
+            # 这样可以避免scene_idxs和bodies索引不匹配的问题
+            sub_scene = self.scene.sub_scenes[target_env_idx]
+            physx_drive = sub_scene.create_drive(
+                tcp_entity,           # TCP实体
+                sapien.Pose(),        # 父体本地姿态 - 修复：直接使用sapien.Pose()
+                target_entity,        # 目标物体实体
+                sapien.Pose()         # 子体本地姿态 - 修复：直接使用sapien.Pose()
+            )
+
+            # 手动创建Drive包装器以便后续管理
+            constraint = Drive(
+                _objs=[physx_drive],
+                _scene_idxs=torch.tensor([target_env_idx], device=self.device),
+                pose_in_child=sapien.Pose(),
+                pose_in_parent=sapien.Pose(),
+                scene=self.scene
             )
             
             # 设置约束参数使其表现为固定约束（类似PyBullet的JOINT_FIXED）
-            # 线性约束（X, Y, Z方向）
-            constraint.set_drive_property_x(stiffness=self.SUCTION_STIFFNESS, damping=self.SUCTION_DAMPING)
-            constraint.set_drive_property_y(stiffness=self.SUCTION_STIFFNESS, damping=self.SUCTION_DAMPING)
-            constraint.set_drive_property_z(stiffness=self.SUCTION_STIFFNESS, damping=self.SUCTION_DAMPING)
-            
-            # 角度约束（绕X, Y, Z轴的旋转）
-            # 注意：Drive对象可能没有角度约束方法，先尝试设置限制
+            # 直接调用底层PhysxDriveComponent的方法（这些方法没有@before_gpu_init限制）
             try:
-                # 设置限制来模拟固定约束
-                constraint.set_limit_x(0, 0)  # 不允许X方向移动
-                constraint.set_limit_y(0, 0)  # 不允许Y方向移动
-                constraint.set_limit_z(0, 0)  # 不允许Z方向移动
-                #print("✅ 已设置位置限制")
+                # 线性约束（X, Y, Z方向）
+                physx_drive.set_drive_property_x(stiffness=self.SUCTION_STIFFNESS, damping=self.SUCTION_DAMPING)
+                physx_drive.set_drive_property_y(stiffness=self.SUCTION_STIFFNESS, damping=self.SUCTION_DAMPING)
+                physx_drive.set_drive_property_z(stiffness=self.SUCTION_STIFFNESS, damping=self.SUCTION_DAMPING)
+                print(f"环境{env_idx}: ✅ 已设置驱动属性")
+            except Exception as drive_error:
+                print(f"环境{env_idx}: ❌ 设置驱动属性失败: {drive_error}")
+                return False
+            
+            # 设置位置限制来模拟固定约束
+            try:
+                physx_drive.set_limit_x(0, 0)  # 不允许X方向移动
+                physx_drive.set_limit_y(0, 0)  # 不允许Y方向移动
+                physx_drive.set_limit_z(0, 0)  # 不允许Z方向移动
+                print(f"环境{env_idx}: ✅ 已设置位置限制")
             except Exception as limit_error:
-                pass
-                #print(f"⚠️ 设置限制失败: {limit_error}")
+                print(f"环境{env_idx}: ⚠️ 设置限制失败: {limit_error}")
                 # 继续执行，仅使用驱动属性
             
-            # 存储约束
-            self.suction_constraints[target_object.name] = constraint
-            self.is_suction_active = True
-            self.current_suction_object = target_object
+            # 存储约束 - 使用环境特定的键
+            constraint_key = f"{target_object.name}_env_{env_idx}"
+            self.suction_constraints[constraint_key] = constraint
+            self.is_suction_active[env_idx] = True
+            self.current_suction_object[env_idx] = target_object
             
-            #print(f"✅ 吸盘约束创建成功: {target_object.name}")
+            print(f"环境{env_idx}: ✅ 吸盘约束创建成功: {constraint_key}")
             return True
             
         except Exception as e:
-            #print(f"❌ 创建吸盘约束失败: {e}")
+            print(f"环境{env_idx}: ❌ 创建吸盘约束失败: {e}")
             import traceback
+            print(f"环境{env_idx}: 详细错误信息:")
             traceback.print_exc()
             return False
 
-    def _remove_suction_constraint(self) -> bool:
+    def _remove_suction_constraint(self, env_idx: int = 0) -> bool:
         """
         移除吸盘约束
+        
+        Args:
+            env_idx: 环境索引（多环境支持）
         
         Returns:
             bool: 是否成功移除约束
         """
-        if not self.is_suction_active or self.current_suction_object is None:
+        if not self.is_suction_active[env_idx] or self.current_suction_object[env_idx] is None:
             #print("没有激活的吸盘约束需要移除")
             return False
         
         try:
-            # 获取约束对象
-            constraint_name = self.current_suction_object.name
-            if constraint_name in self.suction_constraints:
-                constraint = self.suction_constraints[constraint_name]
+            # 获取约束对象 - 使用环境特定的键
+            constraint_key = f"{self.current_suction_object[env_idx].name}_env_{env_idx}"
+            if constraint_key in self.suction_constraints:
+                constraint = self.suction_constraints[constraint_key]
                 
-                #print(f"正在禁用约束: {constraint_name}")
+                print(f"环境{env_idx}: 正在移除吸盘约束: {constraint_key}")
+                
+                # 关键修复：直接操作底层PhysxDriveComponent对象
+                physx_drive = constraint._objs[0]  # 获取底层的PhysxDriveComponent对象
                 
                 # 方法1: 通过设置刚度为0来禁用约束（最有效）
                 try:
-                    #print("设置约束刚度为0...")
-                    constraint.set_drive_property_x(stiffness=0.0, damping=0.0)
-                    constraint.set_drive_property_y(stiffness=0.0, damping=0.0)
-                    constraint.set_drive_property_z(stiffness=0.0, damping=0.0)
-                    #print("✅ 成功禁用约束驱动属性")
+                    print(f"环境{env_idx}: 设置约束刚度为0...")
+                    physx_drive.set_drive_property_x(stiffness=0.0, damping=0.0)
+                    physx_drive.set_drive_property_y(stiffness=0.0, damping=0.0)
+                    physx_drive.set_drive_property_z(stiffness=0.0, damping=0.0)
+                    print(f"环境{env_idx}: ✅ 成功禁用约束驱动属性")
                 except Exception as disable_error:
-                    #print(f"❌ 禁用约束驱动属性失败: {disable_error}")
+                    print(f"环境{env_idx}: ❌ 禁用约束驱动属性失败: {disable_error}")
                     return False
                 
                 # 方法2: 重置约束限制（辅助方法）
                 try:
-                    #print("重置约束限制...")
+                    print(f"环境{env_idx}: 重置约束限制...")
                     # 设置非常大的限制范围，相当于取消限制
-                    constraint.set_limit_x(-1000, 1000)
-                    constraint.set_limit_y(-1000, 1000)
-                    constraint.set_limit_z(-1000, 1000)
-                    #print("✅ 成功重置约束限制")
+                    physx_drive.set_limit_x(-1000, 1000)
+                    physx_drive.set_limit_y(-1000, 1000)
+                    physx_drive.set_limit_z(-1000, 1000)
+                    print(f"环境{env_idx}: ✅ 成功重置约束限制")
                 except Exception as limit_error:
-                    #print(f"⚠️ 重置约束限制失败: {limit_error}")
+                    print(f"环境{env_idx}: ⚠️ 重置约束限制失败: {limit_error}")
                     # 限制重置失败不影响主要功能，继续执行
                     pass
                 
                 # 清理约束引用
-                del self.suction_constraints[constraint_name]
-                #print(f"✅ 约束引用已清理: {constraint_name}")
+                del self.suction_constraints[constraint_key]
+                print(f"环境{env_idx}: ✅ 约束引用已清理: {constraint_key}")
             else:
-                print(f"⚠️ 未找到约束对象: {constraint_name}")
+                print(f"环境{env_idx}: ⚠️ 未找到约束对象: {constraint_key}")
+                pass
             
             # 重置吸盘状态
-            self.is_suction_active = False
-            self.current_suction_object = None
+            self.is_suction_active[env_idx] = False
+            self.current_suction_object[env_idx] = None
             
-            #print("✅ 吸盘状态已重置")
+            print(f"环境{env_idx}: ✅ 吸盘状态已重置")
+            
             return True
             
         except Exception as e:
-            #print(f"❌ 移除吸盘约束失败: {e}")
+            print(f"环境{env_idx}: ❌ 移除吸盘约束失败: {e}")
             import traceback
             traceback.print_exc()
             
             # 即使移除失败，也要重置状态
-            self.is_suction_active = False
-            self.current_suction_object = None
+            self.is_suction_active[env_idx] = False
+            self.current_suction_object[env_idx] = None
             return False
 
-    def _is_contacting_object(self, target_object: Actor, threshold: float = 0.05) -> bool:
+    def _is_contacting_object(self, target_object: Actor, threshold: float = 0.05, env_idx: int = 0) -> bool:
         """
         检测TCP是否与物体接触
         
         Args:
             target_object: 目标物体
             threshold: 距离阈值
+            env_idx: 环境索引（多环境支持）
             
         Returns:
             bool: 是否接触
         """
         try:
-            # 计算TCP到物体的距离
+            # 计算TCP到物体的距离 - 使用对应环境的TCP位置
             tcp_pos = self.agent.tcp.pose.p
             if tcp_pos.dim() > 1:
-                tcp_pos = tcp_pos[0]
-                
+                if env_idx < tcp_pos.shape[0]:
+                    tcp_pos = tcp_pos[env_idx]
+                else:
+                    tcp_pos = tcp_pos[0]
+                    print(f"⚠️ 环境{env_idx}: TCP位置索引越界，使用环境0的位置")
+            
+            # 正确获取多环境下的物体位置
             obj_pos = target_object.pose.p
-            if obj_pos.dim() > 1:
-                obj_pos = obj_pos[0]
+            obj_pos = obj_pos[0]
             
             # 计算距离
-            distance = torch.linalg.norm(tcp_pos - obj_pos).item() -0.05
+            raw_distance = torch.linalg.norm(tcp_pos - obj_pos).item()
+            # 🔧 修复：使用更合理的半径估计值
+            # TCP半径约2cm，物体平均半径约3cm，总计约5cm
+            estimated_radius = 0.1  # 10cm的半径估计，与_check_suction_grasp_success保持一致
+            distance = raw_distance - estimated_radius
             
-            #print(f"TCP到物体距离: {distance:.4f}m, 阈值: {threshold:.4f}m")
+            print(f"环境{env_idx}: TCP到物体距离检测: 原始距离={raw_distance:.4f}m, 调整后距离={distance:.4f}m, 阈值={threshold:.4f}m, 接触={'是' if distance <= threshold else '否'}")
             
             # 检查是否在接触阈值内
             return distance <= threshold
             
         except Exception as e:
-            #print(f"检测接触失败: {e}")
+            print(f"环境{env_idx}: 检测接触失败: {e}")
             return False
 
-    def _check_suction_grasp_success(self, target_object: Actor) -> bool:
+    def _check_suction_grasp_success(self, target_object: Actor, env_idx: int = 0) -> bool:
         """
         检查吸盘抓取是否成功
         
         Args:
             target_object: 目标物体
+            env_idx: 环境索引（多环境支持）
             
         Returns:
             bool: 抓取是否成功
         """
         try:
             # 方法1：检查吸盘状态
-            if (self.is_suction_active and 
-                self.current_suction_object is not None and 
-                self.current_suction_object.name == target_object.name):
+            if (self.is_suction_active[env_idx] and 
+                self.current_suction_object[env_idx] is not None and 
+                self.current_suction_object[env_idx].name == target_object.name):
                 
                 # 方法2：检查物体是否仍在TCP附近
                 tcp_pos = self.agent.tcp.pose.p
                 if tcp_pos.dim() > 1:
-                    tcp_pos = tcp_pos[0]
+                    if env_idx < tcp_pos.shape[0]:
+                        tcp_pos = tcp_pos[env_idx]
+                    else:
+                        tcp_pos = tcp_pos[0]
+                        print(f"⚠️ 环境{env_idx}: TCP位置索引越界，使用环境0的位置")
                 
                 obj_pos = target_object.pose.p
-                if obj_pos.dim() > 1:
-                    obj_pos = obj_pos[0]
+                obj_pos = obj_pos[0]
                 
-                distance = torch.linalg.norm(tcp_pos - obj_pos).item()-0.10
+                raw_distance = torch.linalg.norm(tcp_pos - obj_pos).item()
+                # 🔧 修复：使用与接触检测一致的半径估计
+                estimated_radius = 0.1  # 10cm的半径估计，与_is_contacting_object保持一致
+                distance = raw_distance - estimated_radius
                 
                 # 距离小于5cm认为抓取成功
-                success = distance < 0.05
+                success_threshold = 0.05
+                success = distance < success_threshold
                 
-                if success:
-                    #print(f"✅ 吸盘抓取成功验证: 距离={distance:.4f}m")
-                    pass
-                else:
-                    #print(f"❌ 吸盘抓取失败: 距离过远={distance:.4f}m")
-                    pass
+                print(f"环境{env_idx}: 抓取成功检测 - 原始距离={raw_distance:.4f}m, 调整后距离={distance:.4f}m, 成功={'是' if success else '否'}")
                 
                 return success
             else:
-                #print("❌ 吸盘未激活或物体不匹配")
+                print(f"环境{env_idx}: 吸盘未激活或物体不匹配")
                 return False
                 
         except Exception as e:
-            #print(f"检查吸盘抓取成功失败: {e}")
+            print(f"环境{env_idx}: 检查吸盘抓取成功失败: {e}")
             return False
     
-    def _pick_object_8_states(self, obj_idx: int) -> Tuple[bool, float]:
-        """
-        8状态抓取流程
-        
-        Args:
-            obj_idx: 物体索引
-            
-        Returns:
-            success: 抓取是否成功
-            displacement: 其他物体的位移
-        """
-        if obj_idx >= len(self.all_objects):
-            #print(f"物体索引{obj_idx}超出范围")
-            return False, 0.0
-        
-        # 获取目标物体
-        target_obj = self.all_objects[obj_idx]
-        
-        # 记录抓取前其他物体的位置
-        other_objects_pos_before = []
-        for i, obj in enumerate(self.all_objects):
-            if i != obj_idx and i not in self.grasped_objects:
-                obj_pos = obj.pose.p
-                if obj_pos.dim() > 1:
-                    obj_pos = obj_pos[0]
-                other_objects_pos_before.append(obj_pos.clone())
-        
-        try:
-            # 获取目标物体位置
-            obj_pos = target_obj.pose.p
-            if obj_pos.dim() > 1:
-                obj_pos = obj_pos[0]
-            obj_pos = obj_pos.cpu().numpy()
-            
-             # 等待物体稳定落下
-            for _ in range(10):  # 让物体稳定
-                action = torch.zeros(7, device=self.device, dtype=torch.float32)
-                super().step(action)
-
-            #print(f"开始8状态抓取流程，目标物体{obj_idx}，位置: {obj_pos}")
-            
-            # 检查是否在机械臂范围内
-            robot_base = np.array([-0.615, 0, 0])  # 机械臂基座位置
-            distance = np.linalg.norm(obj_pos[:2] - robot_base[:2])
-            if distance > 0.6:  # 最大抓取范围60cm
-                #print(f"物体{obj_idx}超出机械臂范围，距离: {distance:.3f}m")
-                return False, 0.0
-            
-            # # 检查是否被遮挡（简化版射线检测）
-            # if self._is_object_blocked(target_obj):
-            #     print(f"物体{obj_idx}被遮挡")
-            #     return False, 0.0
-            
-            # === 状态0: 机械臂上升到物体上方 ===
-            #print("状态0: 机械臂上升到物体上方")
-            approach_pos = obj_pos.copy()
-            approach_pos[2] += 0.15  # 减少高度：从20cm改为15cm
-            
-            if not self._move_to_position(approach_pos, steps=150):  # 增加步数：100->150
-                #print("状态0失败：无法移动到物体上方")
-                return False, 0.0
-            
-            # === 状态1: 机械臂下降到物体上方准备抓取 ===
-            #print("状态1: 机械臂下降到物体上方")
-            descend_pos = obj_pos.copy()
-            descend_pos[2] += 0.03  # 减少高度：从5cm改为3cm，更接近物体
-            
-            if not self._move_to_position(descend_pos, steps=80):  # 增加步数：50->80
-                #print("状态1失败：无法下降到物体上方")
-                return False, 0.0
-            
-            # === 状态2: 吸取/抓取物体 ===
-            #print("状态2: 抓取物体")
-            grasp_pos = obj_pos.copy()
-            grasp_pos[2] += 0.01  # 减少高度：从2cm改为1cm，更贴近物体
-            
-            if not self._move_to_position(grasp_pos, steps=80):  # 增加步数：50->80
-                #print("状态2失败：无法抓取物体")
-                return False, 0.0
-
-            # 使用吸盘约束替代夹爪控制
-            #  print("状态2: 激活吸盘约束")
-            suction_success = self._create_suction_constraint(target_obj)
-            if not suction_success:
-                #print("状态2失败：无法创建吸盘约束")
-                return False, 0.0
-
-            # 检查抓取是否成功
-            if not self._check_suction_grasp_success(target_obj):
-                #print("状态2失败：吸盘抓取不成功")
-                self._remove_suction_constraint()  # 清理失败的约束
-                return False, 0.0
-            
-            # === 状态3: 物体上升 ===
-            #print("状态3: 物体上升")
-            lift_pos = grasp_pos.copy()
-            lift_pos[2] += 0.2  # 减少高度：从30cm改为20cm
-            
-            if not self._move_to_position(lift_pos, steps=100):  # 增加步数：80->100
-                #print("状态3失败：无法提升物体")
-                self._remove_suction_constraint()  # 清理约束
-                return False, 0.0
-            
-            # === 状态4: 移动到放置位置 ===
-            #print("状态4: 移动到放置位置")
-            transport_pos = np.array([-0.4, 0.4, lift_pos[2]])  # 目标区域上方
-            
-            if not self._move_to_position(transport_pos, steps=180):  # 增加步数：100->120
-                #print("状态4失败：无法移动到放置位置")
-                self._remove_suction_constraint()  # 清理约束
-                return False, 0.0
-            
-            # === 状态5: 下降到放置位置 ===
-            #print("状态5: 下降到放置位置")
-            lower_pos = transport_pos.copy()
-            lower_pos[2] -= 0.2  # 减少高度：从30cm改为20cm
-            
-            if not self._move_to_position(lower_pos, steps=100):  # 增加步数：80->100
-                #print("状态5失败：无法下降到放置位置")
-                self._remove_suction_constraint()  # 清理约束
-                return False, 0.0
-            
-            # === 状态6: 放下物体 ===
-            #print("状态6: 放下物体")
-            release_pos = lower_pos.copy()
-            
-            if not self._move_to_position(release_pos, steps=20):  # 保持较少步数：30->20
-                #print("状态6失败：无法放下物体")
-                self._remove_suction_constraint()  # 清理约束
-                return False, 0.0
-            
-            # 移除吸盘约束替代打开夹爪
-            #print("状态6: 移除吸盘约束")
-            if not self._remove_suction_constraint():
-                #print("⚠️ 移除吸盘约束失败，但继续执行")
-                pass
-            
-            # 等待物体稳定落下
-            for _ in range(5):  # 等待30步让物体稳定
-                action = torch.zeros(7, device=self.device, dtype=torch.float32)
-                super().step(action)
-            
-            # === 状态7: 回到初始位置 ===
-            #print("状态7: 回到初始位置")
-            home_pos = np.array([-0.6, 0.4, 0.4])  # 回到安全位置
-            
-            if not self._move_to_position(home_pos, steps=100):  # 增加步数：50->100
-                #print("状态7失败：无法回到初始位置")
-                # 这里不返回失败，因为物体已经成功放置
-                pass
-            
-            # 标记抓取成功
-            self.grasped_objects.append(obj_idx)
-            #print(f"8状态抓取流程完成，成功抓取物体{obj_idx}")
-            
-            # 计算其他物体的位移
-            displacement = 0.0
-            for i, obj in enumerate(self.all_objects):
-                if i != obj_idx and i not in self.grasped_objects:
-                    obj_pos_after = obj.pose.p
-                    if obj_pos_after.dim() > 1:
-                        obj_pos_after = obj_pos_after[0]
-                    
-                    # 找到对应的初始位置
-                    if len(other_objects_pos_before) > 0:
-                        # 简化处理：使用第一个可用的初始位置
-                        pos_before = other_objects_pos_before[0] if other_objects_pos_before else obj_pos_after
-                        displacement += torch.linalg.norm(obj_pos_after - pos_before).item()
-            
-            return True, displacement
-            
-        except Exception as e:
-            #print(f"8状态抓取流程出错: {e}")
-            return False, 0.0
+    
     
     def _low_level_step(self, delta_pose: torch.Tensor):
         """单步执行delta pose，只推进仿真，不走离散逻辑"""
@@ -767,6 +532,7 @@ class EnvClutterEnv(BaseEnv):
                     # 创建物体
                     builder = actors.get_actor_builder(self.scene, id=f"ycb:{obj_type}")
                     
+
                     # 在托盘内随机生成位置
                     x, y, z = self._generate_object_position_in_tray(i)
                     
@@ -829,7 +595,7 @@ class EnvClutterEnv(BaseEnv):
         loader = self.scene.create_urdf_loader()
         
         # 设置托盘的物理属性
-        loader.set_material(static_friction=0.8, dynamic_friction=0.6, restitution=0.1)
+        loader.set_material(static_friction=0.8, dynamic_friction=0.6, restitution=0.05)
         loader.fix_root_link = True  # 固定托盘不动
         loader.scale = 1.0  # 保持原始尺寸
         
@@ -848,7 +614,7 @@ class EnvClutterEnv(BaseEnv):
         for env_idx in range(self.num_envs):
             builder = actor_builders[0]
             # 设置托盘位置 (放在桌面上，机器人前方)
-            tray_position = [-0.2, 0.0, 0.02]  # 桌面高度加上托盘底部厚度
+            tray_position = [-0.2, 0.0, 0.006]  # 桌面高度加上托盘底部厚度
             builder.initial_pose = sapien.Pose(p=tray_position)
             builder.set_scene_idxs([env_idx])
             
@@ -867,20 +633,20 @@ class EnvClutterEnv(BaseEnv):
         # 托盘中心位置
         tray_center_x = -0.2
         tray_center_y = 0.0
-        tray_bottom_z = 0.02 + 0.04  # 托盘底部 + 小偏移
+        tray_bottom_z = 0.02 + 0.02  # 托盘底部 + 小偏移
         
         # 托盘边界计算（基于URDF文件中的边界墙位置）
-        # 边界墙在托盘中心的±0.25米处，考虑边界墙厚度0.02米
-        # 实际可用空间：从中心向两边各0.23米（留出安全边距）
-        safe_spawn_area_x = 0.23
-        safe_spawn_area_y = 0.23
+        # 边界墙在托盘中心的±0.2米处
+        # 实际可用空间：从中心向两边各0.18米（留出安全边距）
+        safe_spawn_area_x = 0.18
+        safe_spawn_area_y = 0.18
         
         # 在托盘内随机生成xy位置
         x = tray_center_x + random.uniform(-safe_spawn_area_x, safe_spawn_area_x)
         y = tray_center_y + random.uniform(-safe_spawn_area_y, safe_spawn_area_y)
         
         # 堆叠高度
-        z = tray_bottom_z + stack_level * 0.02  # 每层高度
+        z = tray_bottom_z + stack_level * 0.04  # 每层高度
         
         return x, y, z
 
@@ -978,22 +744,57 @@ class EnvClutterEnv(BaseEnv):
             for i in range(b):
                 self._calculate_exposed_area(env_idx[i])
             
-            # 重新选择目标物体
-            self._sample_target_objects()
+            # 重新选择目标物体 - 只在连续动作模式下使用
+            if not self.use_discrete_action:
+                self._sample_target_objects()
             
             # 新增：初始化离散动作相关变量
             if self.use_discrete_action:
-                self.remaining_indices = list(range(self.MAX_N))
-                self.step_count = 0
-                self.grasped_objects = []
+                # 为每个环境初始化状态
+                if len(self.remaining_indices) != self.num_envs:
+                    self.remaining_indices = [list(range(self.MAX_N)) for _ in range(self.num_envs)]
+                    self.step_count = [0 for _ in range(self.num_envs)]
+                    self.grasped_objects = [[] for _ in range(self.num_envs)]
+                else:
+                    # 重置指定环境的状态
+                    for i, env_id in enumerate(env_idx):
+                        env_id_int = env_id.item() if hasattr(env_id, 'item') else int(env_id)
+                        self.remaining_indices[env_id_int] = list(range(self.MAX_N))
+                        self.step_count[env_id_int] = 0
+                        self.grasped_objects[env_id_int] = []
+                
+                # 新增：重置FSM状态
+                if hasattr(self, 'env_stage') and self.env_stage is not None:
+                    if b == self.num_envs:
+                        # 重置所有环境
+                        self.env_stage.fill_(0)
+                        self.env_target.fill_(-1)
+                        self.env_busy.fill_(False)
+                        self.stage_tick.fill_(0)
+                        self.stage_positions.fill_(0)
+                    else:
+                        # 重置指定环境
+                        for i, env_id in enumerate(env_idx):
+                            env_id_int = env_id.item() if hasattr(env_id, 'item') else int(env_id)
+                            if env_id_int < self.num_envs:
+                                self.env_stage[env_id_int] = 0
+                                self.env_target[env_id_int] = -1
+                                self.env_busy[env_id_int] = False
+                                self.stage_tick[env_id_int] = 0
+                                self.stage_positions[env_id_int].fill_(0)
             
             # 新增：重置吸盘约束状态
             self.suction_constraints = {}
-            self.is_suction_active = False
-            self.current_suction_object = None
+            self.is_suction_active = [False] * self.num_envs  # 每个环境的吸盘激活状态
+            self.current_suction_object = [None] * self.num_envs  # 每个环境当前吸附的物体
             
             
-            # 使用默认重置
+            # 使用指定的机器人初始姿态重置
+            # 指定的关节位置：[-1.6137, 1.3258, 1.9346, -0.8884, -1.6172, 1.0867, -3.0494, 0.04, 0.04]
+            #target_qpos = np.array([-0.5370, 1.3258, 1.9346, -0.8884, -1.6172, 1.0867, -3.0494, 0.04, 0.04])
+
+            # 重置机器人到指定姿态
+            #self.agent.reset(target_qpos)
             self.agent.reset()
 
     def _get_obs_extra(self, info: Dict):
@@ -1001,126 +802,152 @@ class EnvClutterEnv(BaseEnv):
         # 获取批次大小
         batch_size = self.num_envs
         
-        # 基础观测信息
-        obs = dict(
-            is_grasped=info["is_grasped"],
-            tcp_pose=self.agent.tcp.pose.raw_pose,
-            goal_pos=self.goal_site.pose.p,
-        )
-        
-        if "state" in self.obs_mode:
-            if hasattr(self, 'target_object') and self.target_object is not None:
-                obs.update(
-                    target_obj_pose=self.target_object.pose.raw_pose,
-                    tcp_to_obj_pos=self.target_object.pose.p - self.agent.tcp.pose.p,
-                    obj_to_goal_pos=self.goal_site.pose.p - self.target_object.pose.p,
-                )
-            else:
-                # 如果没有目标物体，提供零张量以保持维度一致
-                zero_pose = torch.zeros((batch_size, 7), device=self.device)
-                zero_pos = torch.zeros((batch_size, 3), device=self.device)
-                obs.update(
-                    target_obj_pose=zero_pose,
-                    tcp_to_obj_pos=zero_pos,
-                    obj_to_goal_pos=zero_pos,
-                )
-            
-            # 添加标量观测信息，确保维度一致
-            obs.update(
-                num_objects=torch.tensor([len(self.all_objects)], device=self.device).repeat(batch_size),
-            )
-        
-        # 新增：离散动作相关观测
-        if self.use_discrete_action:
-            # 创建掩码：未抓取=1，已抓取=0
-            mask = torch.ones(batch_size, self.MAX_N, device=self.device)
-            for i, grasped_idx in enumerate(self.grasped_objects):
-                if grasped_idx < self.MAX_N:
-                    mask[:, grasped_idx] = 0
-            
-            # 物体特征：中心坐标、尺寸、暴露面积
-            object_features = torch.zeros(batch_size, self.MAX_N, 7, device=self.device)  # 3+3+1=7维特征
-            
-            for env_idx in range(batch_size):
-                for obj_idx, obj in enumerate(self.all_objects):
-                    if obj_idx < self.MAX_N and obj_idx not in self.grasped_objects:
-                        # 获取物体信息
-                        pos = obj.pose.p[env_idx] if len(obj.pose.p.shape) > 1 else obj.pose.p
-                        
-                        # 获取物体类型和尺寸
-                        obj_type_idx = obj_idx // self.num_objects_per_type
-                        if obj_type_idx < len(self.BOX_OBJECTS):
-                            obj_type = self.BOX_OBJECTS[obj_type_idx]
-                            size = self._get_object_size(obj_type)
-                        else:
-                            size = [0.05, 0.05, 0.05]  # 默认尺寸
-                        
-                        # 获取暴露面积
-                        exposed_area = 1.0  # 简化处理
-                        if hasattr(self, 'object_info') and env_idx < len(self.object_info):
-                            if obj_idx < len(self.object_info[env_idx]):
-                                exposed_area = self.object_info[env_idx][obj_idx].get('exposed_area', 1.0)
-                        
-                        # 组合特征：[x, y, z, w, h, d, exposed_area]
-                        object_features[env_idx, obj_idx] = torch.tensor([
-                            pos[0].item() if hasattr(pos[0], 'item') else pos[0],
-                            pos[1].item() if hasattr(pos[1], 'item') else pos[1],
-                            pos[2].item() if hasattr(pos[2], 'item') else pos[2],
-                            size[0], size[1], size[2],
-                            exposed_area
-                        ], device=self.device)
-            
-            # 将离散动作相关的观测展平为1D向量，避免维度不匹配问题
-            # 将action_mask展平为1D
-            action_mask_flat = mask.flatten(start_dim=1)  # [batch_size, MAX_N]
-            
-            # 将object_features展平为1D
-            object_features_flat = object_features.flatten(start_dim=1)  # [batch_size, MAX_N*7]
-            
-            # 将step_count扩展为与batch_size匹配的1D向量
-            step_count_expanded = torch.tensor([self.step_count], device=self.device).repeat(batch_size).unsqueeze(1)  # [batch_size, 1]
-            
-            # 将所有离散动作相关的观测合并为一个统一的张量
-            discrete_obs = torch.cat([
-                action_mask_flat,
-                object_features_flat,
-                step_count_expanded
-            ], dim=1)  # [batch_size, MAX_N + MAX_N*7 + 1]
-            
-            obs.update(
-                discrete_action_obs=discrete_obs,
+        if not self.use_discrete_action:
+            # 连续动作模式：保持原有观测结构
+            obs = dict(
+                is_grasped=info["is_grasped"],
+                tcp_pose=self.agent.tcp.pose.raw_pose,
+                goal_pos=self.goal_site.pose.p,
             )
             
-            # 在离散动作模式下，将所有观测展平为单一张量以保持维度一致性
-            # 按照固定顺序展平所有观测
-            flattened_parts = []
-            
-            # 按照字母顺序处理各个键，确保顺序一致
-            for key in sorted(obs.keys()):
-                if key in ['sensor_data']:
-                    continue
-                value = obs[key]
-                if isinstance(value, torch.Tensor):
-                    flattened_parts.append(value.flatten())
-                elif isinstance(value, np.ndarray):
-                    flattened_parts.append(torch.from_numpy(value).flatten())
+            if "state" in self.obs_mode:
+                if hasattr(self, 'target_object') and self.target_object is not None:
+                    obs.update(
+                        target_obj_pose=self.target_object.pose.raw_pose,
+                        tcp_to_obj_pos=self.target_object.pose.p - self.agent.tcp.pose.p,
+                        obj_to_goal_pos=self.goal_site.pose.p - self.target_object.pose.p,
+                    )
                 else:
-                    flattened_parts.append(torch.tensor([value]).flatten())
-            
-            # 合并所有部分
-            flattened_obs = torch.cat(flattened_parts, dim=0)
-            
-            # 返回展平后的观测，确保维度一致
-            return flattened_obs.unsqueeze(0)  # 添加batch维度
+                    zero_pose = torch.zeros((batch_size, 7), device=self.device)
+                    zero_pos = torch.zeros((batch_size, 3), device=self.device)
+                    obs.update(
+                        target_obj_pose=zero_pose,
+                        tcp_to_obj_pos=zero_pos,
+                        obj_to_goal_pos=zero_pos,
+                    )
+                
+                obs.update(
+                    num_objects=torch.tensor([len(self.all_objects)], device=self.device).repeat(batch_size),
+                )
+            return obs
         
-        return obs
+        # 离散动作模式：易收敛的baseline特征集
+        
+        # 1. 全局特征 (每环境 3 维)
+        global_features = []
+        for env_idx in range(batch_size):
+            grasped_count = len(self.grasped_objects[env_idx])
+            grasped_ratio = grasped_count / float(self.total_objects_per_env)  # 已抓数量/总数量
+            
+            # 使用抓取尝试次数的比例作为特征
+            attempt_ratio = min(self.step_count[env_idx] / float(self.total_objects_per_env), 1.0)  # 抓取尝试次数/总数量，限制在[0,1]
+            remaining_ratio = (self.total_objects_per_env - grasped_count) / float(self.total_objects_per_env)  # 剩余数量/总数量
+            
+            global_features.append([grasped_ratio, attempt_ratio, remaining_ratio])
+        
+        global_features = torch.tensor(global_features, device=self.device, dtype=torch.float32)  # [batch_size, 3]
+        
+        # 2. 每物体特征 
+        # 获取工作空间范围用于归一化
+        workspace_min = torch.tensor([-0.5, -0.5, 0.0], device=self.device)  # 工作空间最小值
+        workspace_max = torch.tensor([0.5, 0.5, 0.3], device=self.device)     # 工作空间最大值
+        workspace_size = workspace_max - workspace_min
+        
+        # 获取最大物体尺寸用于归一化
+        max_size = 0.2  # 假设最大物体尺寸为0.2m
+        
+        object_features = []  # [batch_size, 8, 8]
+        action_mask = []      # [batch_size, 8]
+        
+        for env_idx in range(batch_size):
+            env_obj_features = []
+            env_mask = []
+            
+            for obj_idx in range(self.total_objects_per_env):  # 动态物体数量
+                # 🔧 修复：使用环境特定的物体列表而不是全局索引
+                if (env_idx < len(self.selectable_objects) and 
+                    obj_idx < len(self.selectable_objects[env_idx])):
+                    
+                    # 获取环境特定的物体
+                    target_obj = self.selectable_objects[env_idx][obj_idx]
+                    obj_pose_p = target_obj.pose.p
+                    
+                    # 处理多环境位置数据
+                    if len(obj_pose_p.shape) > 1 and obj_pose_p.shape[0] > env_idx:
+                        obj_pos = obj_pose_p[env_idx]  # [3]
+                    elif len(obj_pose_p.shape) > 1 and obj_pose_p.shape[0] == 1:
+                        obj_pos = obj_pose_p[0]
+                    else:
+                        obj_pos = obj_pose_p
+                    
+                    # 位置归一化到 [0, 1]
+                    pos_normalized = (obj_pos - workspace_min) / workspace_size
+                    pos_normalized = torch.clamp(pos_normalized, 0.0, 1.0)
+                    
+                    # 获取物体尺寸并归一化
+                    obj_type_idx = obj_idx // self.num_objects_per_type
+                    if obj_type_idx < len(self.BOX_OBJECTS):
+                        obj_type = self.BOX_OBJECTS[obj_type_idx]
+                        size = self._get_object_size(obj_type)
+                        obj_size = torch.tensor(size, device=self.device)
+                    else:
+                        obj_size = torch.tensor([0.05, 0.05, 0.05], device=self.device)
+                    
+                    # 尺寸归一化到 [0, 1]
+                    size_normalized = obj_size / max_size
+                    size_normalized = torch.clamp(size_normalized, 0.0, 1.0)
+                    
+                    # 抓取标志
+                    grabbed_flag = 1.0 if obj_idx in self.grasped_objects[env_idx] else 0.0
+                    
+                    # 高度特征 (可选，如果已包含在pos_normalized中可以去掉)
+                    topness = pos_normalized[2]  # z坐标已经归一化
+                    
+                    # 组合特征: [size_x, size_y, size_z, pos_x, pos_y, pos_z, grabbed_flag, topness]
+                    obj_feature = torch.cat([
+                        size_normalized,      # [3] - 尺寸
+                        pos_normalized,       # [3] - 位置
+                        torch.tensor([grabbed_flag], device=self.device),  # [1] - 抓取标志
+                        torch.tensor([topness], device=self.device)        # [1] - 高度特征
+                    ])  # 总共8维
+                    
+                    # 动作掩码：未抓取=1(可选)，已抓取=0(不可选)
+                    mask_value = 0.0 if grabbed_flag > 0.5 else 1.0
+                    
+                else:
+                    # 填充零特征
+                    obj_feature = torch.zeros(8, device=self.device)
+                    mask_value = 0.0  # 不存在的物体不可选
+                
+                env_obj_features.append(obj_feature)
+                env_mask.append(mask_value)
+            
+            object_features.append(torch.stack(env_obj_features))  # [8, 8]
+            action_mask.append(torch.tensor(env_mask, device=self.device))  # [8]
+        
+        object_features = torch.stack(object_features)  # [batch_size, 8, 8]
+        action_mask = torch.stack(action_mask)          # [batch_size, 8]
+        
+        # 3. 展平物体特征
+        object_features_flat = object_features.view(batch_size, -1)  # [batch_size, total_objects_per_env * 8]
+        
+        # 4. 组合最终观测
+        # obs = concat(obj_feats.flatten(), action_mask, global_feats)
+        final_obs = torch.cat([
+            object_features_flat,  # [batch_size, total_objects_per_env * 8] - 物体特征
+            action_mask,          # [batch_size, total_objects_per_env]  - 动作掩码
+            global_features       # [batch_size, 3]  - 全局特征
+        ], dim=1)  # [batch_size, total_objects_per_env * 9 + 3]
+        
+        # 返回扁平化的观测向量，符合baseline训练要求
+        return final_obs
 
     
     def _close_gripper(self):
         """闭合夹爪"""
         # 构建7维动作向量 [dx, dy, dz, drx, dry, drz, gripper]
-        action = torch.zeros(7, device=self.device)
-        action[6] = 0.00  # 闭合夹爪
+        action = torch.zeros(self.num_envs, 7, device=self.device, dtype=torch.float32)
+        action[:, 6] = 0.00  # 闭合夹爪
         
         # 执行多步以确保夹爪闭合
         for _ in range(5):
@@ -1129,8 +956,8 @@ class EnvClutterEnv(BaseEnv):
     def _open_gripper(self):
         """打开夹爪"""
         # 构建7维动作向量 [dx, dy, dz, drx, dry, drz, gripper]
-        action = torch.zeros(7, device=self.device)
-        action[6] = 0.04  # 打开夹爪
+        action = torch.zeros(self.num_envs, 7, device=self.device, dtype=torch.float32)
+        action[:, 6] = 0.04  # 打开夹爪
         
         # 执行多步以确保夹爪打开
         for _ in range(5):
@@ -1151,52 +978,331 @@ class EnvClutterEnv(BaseEnv):
     
     def _discrete_step(self, action):
         """
-        处理离散动作的step方法
+        处理离散动作的step方法 - 使用while循环管理并行FSM
         
         Args:
-            action: 要抓取的物体在remaining_indices中的索引
+            action: 要抓取的物体索引，形状为(num_envs,)或标量
         """
-        # 检查动作合法性
-        if not isinstance(action, (int, np.integer)):
-            action = int(action)
+        # 确保action是正确的形状
+        if isinstance(action, (int, np.integer)):
+            # 单个动作，复制到所有环境
+            action = np.full(self.num_envs, action)
+        elif isinstance(action, torch.Tensor):
+            action = action.cpu().numpy()
+        elif isinstance(action, np.ndarray):
+            if action.shape == ():  # 标量数组
+                action = np.full(self.num_envs, action.item())
         
-        if action < 0 or action >= len(self.remaining_indices):
-            # 非法动作，返回失败结果
-            return self._get_failed_step_result()
+        # 确保action是正确长度的数组
+        if len(action) != self.num_envs:
+            print(f"警告：动作长度{len(action)}与环境数量{self.num_envs}不匹配")
+            action = np.full(self.num_envs, action[0] if len(action) > 0 else 0)
         
-        # 获取实际的物体索引
-        target_idx = self.remaining_indices[action]
+        # 1. 为空闲环境分配新任务
+        for i in range(self.num_envs):
+            if not self.env_busy[i]:
+                pick = int(action[i])
+                if pick >= 0 and pick < len(self.remaining_indices[i]):
+                    # 获取实际的物体索引
+                    target_idx = self.remaining_indices[i][pick]
+                    self.env_target[i] = target_idx
+                    self.remaining_indices[i].pop(pick)
+                    self.env_stage[i] = 0
+                    self.env_busy[i] = True
+                    self.stage_tick[i] = 0
+                    self.step_count[i] += 1
+                    #print(f"环境{i}: 开始新任务 - 抓取物体索引{target_idx} (选择{pick})")
         
-        # 执行8状态抓取流程
-        success, displacement = self._pick_object_8_states(target_idx)
+        # 2. while循环执行FSM，直到所有环境完成任务
+        max_fsm_steps = 2000  # 防止无限循环的安全限制
+        fsm_step_count = 0
         
-        # 从剩余列表中移除已抓取的物体
-        self.remaining_indices.pop(action)
+        #print(f"开始FSM执行循环 - 忙碌环境: {torch.sum(self.env_busy).item()}")
         
-        # 更新步数
-        self.step_count += 1
+        while torch.any(self.env_busy) and fsm_step_count < max_fsm_steps:
+            # 为所有环境计算当前FSM状态对应的低级连续动作
+            cmd = torch.zeros(self.num_envs, 7, device=self.device, dtype=torch.float32)
+            active_envs = 0
+            
+            for i in range(self.num_envs):
+                if self.env_busy[i]:
+                    cmd[i] = self._pick_object_step(i)
+                    active_envs += 1
+            
+            # 批处理执行一步物理仿真 - 所有环境同步前进
+            super().step(cmd)
+            fsm_step_count += 1
+            
+            # 每500步输出一次进度信息（减少输出频率）
+            if fsm_step_count % 500 == 0:
+                busy_count = torch.sum(self.env_busy).item()
+                print(f"FSM步骤 {fsm_step_count}: 仍有 {busy_count} 个环境在执行任务")
         
-        # 计算奖励 - 转换为torch.Tensor
-        reward = torch.tensor([self.compute_select_reward(success, displacement)], 
-                            device=self.device, dtype=torch.float32)
+        # 检查是否因为超时而退出循环
+        if fsm_step_count >= max_fsm_steps:
+            print(f"⚠️ FSM执行达到最大步数限制 ({max_fsm_steps})，强制结束所有任务")
+            # 强制结束所有任务
+            self.env_busy.fill_(False)
+            for i in range(self.num_envs):
+                if self.env_target[i] != -1:
+                    self.env_target[i] = -1
         
-        # 检查终止条件 - 转换为torch.Tensor
-        terminated = torch.tensor([self.step_count >= self.MAX_EPISODE_STEPS or len(self.remaining_indices) == 0], 
-                                device=self.device, dtype=torch.bool)
-        truncated = torch.tensor([False], device=self.device, dtype=torch.bool)
+        completed_envs = torch.sum(~self.env_busy).item()
+        #print(f"FSM执行完成 - 总步数: {fsm_step_count}, 完成环境数: {completed_envs}")
         
-        # 获取新的观测
-        info = self.evaluate()
-        info.update({
-            'success': success,
-            'displacement': displacement,
-            'remaining_objects': len(self.remaining_indices),
-            'grasped_objects': len(self.grasped_objects),
-        })
+        # 3. 清理已完成任务的环境状态
+        for env_idx in range(self.num_envs):
+            if not self.env_busy[env_idx] and self.env_target[env_idx] != -1:
+                # 重置目标
+                old_target = self.env_target[env_idx].item()
+                self.env_target[env_idx] = -1
+                #print(f"环境{env_idx}: 任务完成，重置目标 {old_target}")
         
-        obs = self._get_obs_extra(info)
+        # 4. 计算最终奖励和观测 - 基于完整动作的最终结果
+        info = self.get_info()
+        obs = self.get_obs(info)
+        reward = self.get_reward(obs=obs, action=action, info=info)
+        
+        # 5. 检查终止条件
+        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        # 使用 info 中的 success 和 fail 状态
+        if "success" in info and "fail" in info:
+            terminated = torch.logical_or(info["success"], info["fail"])
+        elif "success" in info:
+            terminated = info["success"].clone()
+        elif "fail" in info:
+            terminated = info["fail"].clone()
         
         return obs, reward, terminated, truncated, info
+    
+    def _pick_object_step(self, env_idx: int) -> torch.Tensor:
+        """
+        单步状态机执行 - 每次调用只执行当前状态的一小步
+        
+        Args:
+            env_idx: 环境索引
+            
+        Returns:
+            action: 该环境的连续动作向量 [dx, dy, dz, drx, dry, drz, gripper]
+        """
+        stage = self.env_stage[env_idx].item()
+        target_idx = self.env_target[env_idx].item()
+        tick = self.stage_tick[env_idx].item()
+        
+        # 初始化动作向量
+        action = torch.zeros(7, device=self.device, dtype=torch.float32)
+        
+        try:
+            # 关键修复：使用selectable_objects根据环境和相对索引获取正确的物体对象
+            if target_idx < 0 or env_idx >= len(self.selectable_objects) or target_idx >= len(self.selectable_objects[env_idx]):
+                # 无效目标，结束流程
+                print(f"环境{env_idx}: 无效目标索引 target_idx={target_idx}, selectable_objects长度={len(self.selectable_objects[env_idx]) if env_idx < len(self.selectable_objects) else 0}")
+                self.env_busy[env_idx] = False
+                return action
+            
+            # 使用环境特定的物体列表获取目标物体
+            target_obj = self.selectable_objects[env_idx][target_idx]
+            #print(f"环境{env_idx}: 使用目标物体 {target_obj.name} (环境内索引={target_idx})")
+            
+            # 获取目标物体位置
+            obj_pos = target_obj.pose.p
+            obj_pos = obj_pos[0]
+            obj_pos = obj_pos.cpu().numpy()
+            
+            # 获取当前TCP位置
+            tcp_pos = self.agent.tcp.pose.p
+            if tcp_pos.dim() > 1:
+                if env_idx < tcp_pos.shape[0]:
+                    tcp_pos = tcp_pos[env_idx]
+                else:
+                    tcp_pos = tcp_pos[0]
+                    print(f"⚠️ 环境{env_idx}: TCP位置索引越界，使用环境0的位置")
+            
+            # 状态机逻辑
+            if stage == 0:
+                # 状态0: 移动到物体上方
+                if tick == 0:
+                    # 第一次进入此状态，设置目标位置
+                    target_pos = obj_pos.copy()
+                    target_pos[2] += 0.15  # 上方15cm
+                    self.stage_positions[env_idx] = torch.tensor(target_pos, device=self.device)
+                    print(f"环境{env_idx}: 状态0初始化 - 物体位置={obj_pos}, 目标位置={target_pos}")
+                
+                target_pos = self.stage_positions[env_idx]
+                action[:3], reached = self._get_move_action(tcp_pos, target_pos, max_steps=150)
+                
+                # 添加调试信息
+                current_distance = torch.linalg.norm(tcp_pos - target_pos).item()
+                # 打印进度（减少输出频率）
+                if tick % 10 == 0 :  # 前5步和每30步输出一次
+                    #print(f"环境{env_idx}: 状态0 步{tick} - TCP位置={tcp_pos.cpu().numpy()}, 目标位置={target_pos.cpu().numpy()}, 距离={current_distance:.4f}m, 到达={'是' if reached else '否'}")
+                    print(f"环境{env_idx}: 状态0 步{tick}, 距离={current_distance:.4f}m, 到达={'是' if reached else '否'}")
+                
+                if reached or tick >= 150:
+                    print(f"环境{env_idx}: 状态0完成 - reached={reached}, tick={tick}")
+                    self.env_stage[env_idx] = 1
+                    self.stage_tick[env_idx] = 0
+                else:
+                    self.stage_tick[env_idx] += 1
+            
+            elif stage == 1:
+                # 状态1: 下降到物体上方
+                if tick == 0:
+                    target_pos = obj_pos.copy()
+                    target_pos[2] += 0.05  # 上方3cm
+                    self.stage_positions[env_idx] = torch.tensor(target_pos, device=self.device)
+                
+                target_pos = self.stage_positions[env_idx]
+                action[:3], reached = self._get_move_action(tcp_pos, target_pos, max_steps=80)
+                
+                # if reached or tick >= 80:
+                #     self.env_stage[env_idx] = 2
+                #     self.stage_tick[env_idx] = 0
+                # else:
+                #     self.stage_tick[env_idx] += 1
+                if reached or tick >= 80:
+                    # 尝试创建吸盘约束
+                    suction_success = self._create_suction_constraint(target_obj, env_idx)
+                    if suction_success and self._check_suction_grasp_success(target_obj, env_idx):
+                        self.env_stage[env_idx] = 2
+                        self.stage_tick[env_idx] = 0
+                    else:
+                        # 抓取失败，结束流程
+                        print(f"环境{env_idx}: 抓取失败，结束流程")
+                        self.env_busy[env_idx] = False
+                else:
+                    self.stage_tick[env_idx] += 1              
+
+            elif stage == 2:
+                # 状态2: 直接移动到位置上方20cm
+                if tick == 0:
+                    # 定义固定的放置区域位置，避免跟随对象位置变化
+                    drop_zone_pos = np.array([-0.2, 0.2, 0.25])  # 放置位置上方20cm (0.05+0.2=0.25)
+                    self.stage_positions[env_idx] = torch.tensor(drop_zone_pos, device=self.device)
+
+                target_pos = self.stage_positions[env_idx]
+                action[:3], reached = self._get_move_action(tcp_pos, target_pos, max_steps=200)
+
+                if reached or tick >= 150:
+                    self.env_stage[env_idx] = 3
+                    self.stage_tick[env_idx] = 0
+                else:
+                    self.stage_tick[env_idx] += 1
+            
+            elif stage == 3:
+                # 状态3: 移除吸盘约束，删除物体
+                if tick == 0:
+                    # 移除吸盘约束（只在第一次尝试）
+                    try:
+                        if self.is_suction_active[env_idx] and self.current_suction_object[env_idx] is not None:
+                            success = self._remove_suction_constraint(env_idx)
+                            if success:
+                                print(f"环境{env_idx}: Stage 5 - 移除吸盘约束成功")
+                            else:
+                                print(f"环境{env_idx}: Stage 5 - 移除吸盘约束失败")
+                    except Exception as e:
+                        print(f"环境{env_idx}: Stage 5 - 移除吸盘约束异常: {e}")
+                        pass
+                # 等待物体稳定
+                if tick >= 10:  # 等待10步让物体稳定
+                    self.env_stage[env_idx] = 6
+                    self.stage_tick[env_idx] = 0
+                    #print(f"环境{env_idx}: Stage 5完成，进入Stage 6")
+                else:
+                    self.stage_tick[env_idx] += 1
+            
+            elif stage == 6:
+                # 状态6: 回到初始位置
+                if tick == 0:
+                    # 固定的安全初始位置，避免任何动态变化
+                    initial_pos = np.array([-0.2, 0, 0.4])  
+                    self.stage_positions[env_idx] = torch.tensor(initial_pos, device=self.device)
+                    #print(f"环境{env_idx}: Stage 6 - 回到初始位置: {initial_pos}")
+
+                target_pos = self.stage_positions[env_idx]
+                action[:3], reached = self._get_move_action(tcp_pos, target_pos, max_steps=150)
+
+                if reached or tick >= 150:
+                    # 完成整个流程
+                    self.env_busy[env_idx] = False
+                    self.grasped_objects[env_idx].append(target_idx)
+                    self.stage_tick[env_idx] = 0
+                    print(f"环境{env_idx}完成抓取物体{target_obj.name} (相对索引={target_idx}) - 全流程结束")
+                else:
+                    self.stage_tick[env_idx] += 1
+            
+            else:
+                # 未知状态，结束流程
+                self.env_busy[env_idx] = False
+            
+            # 姿态控制：保持垂直向下
+            action[3:6] = 0.0
+            # 夹爪控制
+            action[6] = 0.0
+            
+            return action
+            
+        except Exception as e:
+            print(f"状态机执行错误 env={env_idx}, stage={stage}: {e}")
+            # 出错时结束流程
+            self.env_busy[env_idx] = False
+            return action
+    
+    def _get_move_action(self, current_pos: torch.Tensor, target_pos: torch.Tensor, 
+                        max_steps: int = 100) -> Tuple[torch.Tensor, bool]:
+        """
+        获取移动动作和是否到达目标
+        
+        Args:
+            current_pos: 当前位置
+            target_pos: 目标位置
+            max_steps: 最大步数（用于判断超时）
+            
+        Returns:
+            action: 位置动作 [dx, dy, dz]
+            reached: 是否到达目标
+        """
+        if isinstance(target_pos, np.ndarray):
+            target_pos = torch.tensor(target_pos, device=self.device, dtype=torch.float32)
+        
+        # 计算位置误差
+        pos_error = target_pos - current_pos
+        current_distance = torch.linalg.norm(pos_error).item()
+        
+        # 判断是否到达 - 放宽阈值到5cm
+        reached = current_distance < 0.05
+        
+        if reached:
+            print(f"_get_move_action: 已到达目标，距离={current_distance:.4f}m")
+            return torch.zeros(3, device=self.device, dtype=torch.float32), True
+        
+        # 计算移动动作
+        max_controller_step = 0.1  # 控制器支持的最大增量：10cm
+        
+        # 优化步长策略 - 提高收敛速度
+        if current_distance > 0.15:
+            scale_factor = 1.0  # 使用100%的控制器能力
+        elif current_distance > 0.10:
+            scale_factor = 0.95  # 稍微减速
+        elif current_distance > 0.05:
+            scale_factor = 0.8  # 中等速度
+        else:
+            scale_factor = 0.7  # 提高精细控制速度（从0.5提升到0.7）
+        
+        actual_max_step = max_controller_step * scale_factor
+        
+        # 归一化位置误差
+        pos_error_norm = torch.linalg.norm(pos_error)
+        if pos_error_norm > actual_max_step:
+            action = (pos_error / pos_error_norm) * actual_max_step
+        else:
+            action = pos_error
+        
+        #print(f"_get_move_action: 距离={current_distance:.4f}m, 动作={action.cpu().numpy()}, scale_factor={scale_factor}")
+        
+        return action, False
     
     def _get_failed_step_result(self):
         """获取失败步骤的结果"""
@@ -1212,35 +1318,15 @@ class EnvClutterEnv(BaseEnv):
         info.update({
             'success': False,
             'displacement': 0.0,
-            'remaining_objects': len(self.remaining_indices),
-            'grasped_objects': len(self.grasped_objects),
+            'remaining_objects': sum(len(env_remaining) for env_remaining in self.remaining_indices),
+            'grasped_objects': sum(len(env_grasped) for env_grasped in self.grasped_objects),
         })
         
         obs = self._get_obs_extra(info)
         
         return obs, reward, terminated, truncated, info
 
-    def compute_select_reward(self, grasp_success: bool, displacement: float) -> float:
-        """
-        计算离散动作选择的奖励
-        
-        Args:
-            grasp_success: 抓取是否成功
-            displacement: 其他物体的位移
-            
-        Returns:
-            reward: 奖励值
-        """
-        # 基础奖励：成功抓取
-        reward = 1.0 if grasp_success else 0.0
-        
-        # 位移惩罚
-        reward -= displacement * 1.5  # disp_coeff
-        
-        # 时间惩罚
-        reward -= 0.01  # time_coeff
-        
-        return reward
+
 
     @property
     def discrete_action_space(self):
@@ -1254,28 +1340,50 @@ class EnvClutterEnv(BaseEnv):
     def evaluate(self):
         """评估任务完成情况"""
         success = torch.zeros(self.num_envs, device=self.device, dtype=bool)
+        fail = torch.zeros(self.num_envs, device=self.device, dtype=bool)
         is_grasped = torch.zeros(self.num_envs, device=self.device, dtype=bool)
         is_robot_static = torch.zeros(self.num_envs, device=self.device, dtype=bool)
         is_obj_placed = torch.zeros(self.num_envs, device=self.device, dtype=bool)
         
-        if hasattr(self, 'target_object') and self.target_object is not None:
-            # 检查物体是否放置到目标位置
-            obj_to_goal_dist = torch.linalg.norm(
-                self.goal_site.pose.p - self.target_object.pose.p, axis=1
-            )
-            is_obj_placed = obj_to_goal_dist <= self.goal_thresh
-            
-            # 检查是否抓取
-            is_grasped = self.agent.is_grasping(self.target_object)
-            
-            # 检查机器人是否静止
-            is_robot_static = self.agent.is_static(0.2)
-            
-            # 成功条件：物体放置到位且机器人静止
-            success = is_obj_placed & is_robot_static
+        if self.use_discrete_action:
+            # 离散动作模式：基于抓取成功的物体数量比例评估
+            for env_idx in range(self.num_envs):
+                # 计算抓取成功的物体数量
+                grasped_count = len(self.grasped_objects[env_idx])
+                
+                # 检查是否有物体被成功抓取
+                is_grasped[env_idx] = grasped_count > 0
+                
+                # 计算成功率：抓取成功的物体数量比例
+                success_ratio = grasped_count / self.total_objects_per_env
+                success[env_idx] = success_ratio == 1.0   # 所有物体都被抓取认为成功
+                
+                # 失败条件：达到最大抓取尝试次数但未成功
+                # 注意：step_count是抓取尝试次数，不是总仿真步数
+                # MAX_EPISODE_STEPS=15 表示最多15次抓取尝试
+                if hasattr(self, 'step_count'):
+                    fail[env_idx] = self.step_count[env_idx] >= self.MAX_EPISODE_STEPS and not success[env_idx]
+        else:
+            # 连续动作模式：基于target_object评估
+            if hasattr(self, 'target_object') and self.target_object is not None:
+                # 检查物体是否放置到目标位置
+                obj_to_goal_dist = torch.linalg.norm(
+                    self.goal_site.pose.p - self.target_object.pose.p, axis=1
+                )
+                is_obj_placed = obj_to_goal_dist <= self.goal_thresh
+                
+                # 检查是否抓取
+                is_grasped = self.agent.is_grasping(self.target_object)
+                
+                # 检查机器人是否静止
+                is_robot_static = self.agent.is_static(0.2)
+                
+                # 成功条件：物体放置到位且机器人静止
+                success = is_obj_placed & is_robot_static
         
         return {
             "success": success,
+            "fail": fail,
             "is_obj_placed": is_obj_placed,
             "is_robot_static": is_robot_static,
             "is_grasped": is_grasped,
@@ -1311,6 +1419,67 @@ class EnvClutterEnv(BaseEnv):
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
         """计算密集奖励"""
+        reward = torch.zeros(self.num_envs, device=self.device)
+        
+        # 根据动作模式选择不同的奖励计算策略
+        if self.use_discrete_action:
+            # 离散动作模式：使用选择奖励逻辑
+            return self._compute_discrete_action_reward(info)
+        else:
+            # 连续动作模式：使用原有的密集奖励逻辑
+            return self._compute_continuous_action_reward(info)
+    
+    def _compute_discrete_action_reward(self, info: Dict):
+        """计算离散动作模式的奖励 - 基于完整动作的最终结果
+        
+        注意：在新架构下，每个RL步骤对应一个完整的抓取动作，
+        奖励基于该动作的最终结果计算，更简洁且易于收敛
+        """
+        reward = torch.zeros(self.num_envs, device=self.device)
+        
+        # 奖励系数 - 针对完整动作优化
+        R_success = 3.0      # 成功抓取一个物体的奖励
+        R_complete = 15.0    # 完成所有物体的额外奖励
+        R_failure = -0.5     # 抓取失败的惩罚
+        w_disp = 0.8         # 位移惩罚权重
+        
+        for env_idx in range(self.num_envs):
+            current_grasped = len(self.grasped_objects[env_idx])
+            
+            # 检查是否有新的成功抓取
+            if not hasattr(self, '_prev_grasped_count'):
+                self._prev_grasped_count = [0] * self.num_envs
+            
+            prev_grasped = self._prev_grasped_count[env_idx]
+            
+            if current_grasped > prev_grasped:
+                # 成功抓取了新物体
+                new_grasps = current_grasped - prev_grasped
+                reward[env_idx] += R_success * new_grasps
+                
+                # 检查是否完成所有物体
+                if current_grasped == self.total_objects_per_env:
+                    reward[env_idx] += R_complete
+                    
+            # elif hasattr(self, 'step_count') and self.step_count[env_idx] > prev_grasped:
+            #     # 有抓取尝试但没有成功（step_count增加但grasped_count没变）
+            #     reward[env_idx] += R_failure
+            
+            # # 简化的位移惩罚
+            # other_displacement = self._calculate_other_objects_displacement()
+            # if env_idx < len(other_displacement):
+            #     # 将位移惩罚限制在合理范围内
+            #     displacement_penalty = torch.clamp(other_displacement[env_idx] * w_disp, 0, 2.0)
+            #     reward[env_idx] -= displacement_penalty
+        
+        # 更新记录
+        for env_idx in range(self.num_envs):
+            self._prev_grasped_count[env_idx] = len(self.grasped_objects[env_idx])
+        
+        return reward
+    
+    def _compute_continuous_action_reward(self, info: Dict):
+        """计算连续动作模式的奖励"""
         reward = torch.zeros(self.num_envs, device=self.device)
         
         if not hasattr(self, 'target_object') or self.target_object is None:
@@ -1370,23 +1539,17 @@ class EnvClutterEnv(BaseEnv):
 
     def compute_normalized_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
         """计算归一化密集奖励"""
-        # 检查是否有 reward_mode 属性，如果没有则默认使用 dense 模式
-        if hasattr(self, 'reward_mode') and self.reward_mode == "sparse":
-            return self.compute_sparse_reward(obs=obs, action=action, info=info)
-        else:
-            return self.compute_dense_reward(obs=obs, action=action, info=info) / 10.0 
+        # 根据官方文档，normalized_dense_reward 应该是对 dense_reward 的归一化
+        # 不应该根据 reward_mode 选择不同的奖励函数
+        dense_reward = self.compute_dense_reward(obs=obs, action=action, info=info)
+        return dense_reward / 10.0 
 
-    def reset(self, seed=None, options=None):
-        """重置环境，确保返回一致的观测结构"""
-        # 调用父类的reset方法
-        obs, info = super().reset(seed=seed, options=options)
-        
-        # 在离散动作模式下，确保返回一致的观测结构
-        if self.use_discrete_action:
-            # 获取评估信息
-            eval_info = self.evaluate()
-            
-            # 使用我们的观测处理方法
-            obs = self._get_obs_extra(eval_info)
-        
-        return obs, info 
+ 
+
+    def _init_fsm_states(self):
+        """初始化有限状态机状态张量"""
+        self.env_stage = torch.zeros(self.num_envs, dtype=torch.int8, device=self.device)
+        self.env_target = torch.full((self.num_envs,), -1, dtype=torch.int16, device=self.device)
+        self.env_busy = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.stage_tick = torch.zeros(self.num_envs, dtype=torch.int16, device=self.device)
+        self.stage_positions = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)

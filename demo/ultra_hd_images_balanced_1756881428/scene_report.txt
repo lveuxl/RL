@@ -1,0 +1,44 @@
+论文展示场景图像捕获报告
+========================================
+捕获时间: 2025-09-03 14:37:15
+场景配置: balanced
+物体总数: 15
+目标物体: env_0_004_sugar_box_target_Oi
+
+图像信息:
+--------------------
+文件名: top_view_camera_balanced.png
+描述: 俯视图
+相机: top_view_camera
+分辨率: 4096x2160
+路径: ultra_hd_images_balanced_1756881428/top_view_camera_balanced.png
+
+文件名: side_view_camera_balanced.png
+描述: 侧面45度视图
+相机: side_view_camera
+分辨率: 4096x2160
+路径: ultra_hd_images_balanced_1756881428/side_view_camera_balanced.png
+
+文件名: base_camera_balanced.png
+描述: 默认视图
+相机: base_camera
+分辨率: 1280x960
+路径: ultra_hd_images_balanced_1756881428/base_camera_balanced.png
+
+场景物体列表:
+--------------------
+ 1. env_0_003_cracker_box_object_0
+ 2. env_0_003_cracker_box_object_1
+ 3. env_0_003_cracker_box_object_2
+ 4. env_0_004_sugar_box_target_Oi
+ 5. env_0_004_sugar_box_object_4
+ 6. env_0_004_sugar_box_object_5
+ 7. env_0_008_pudding_box_object_6
+ 8. env_0_008_pudding_box_object_7
+ 9. env_0_008_pudding_box_object_8
+10. env_0_009_gelatin_box_object_9
+11. env_0_009_gelatin_box_object_10
+12. env_0_009_gelatin_box_object_11
+13. env_0_010_potted_meat_can_object_12
+14. env_0_010_potted_meat_can_object_13
+15. env_0_010_potted_meat_can_object_14

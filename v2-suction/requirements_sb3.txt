@@ -1,0 +1,21 @@
+# SB3训练EnvClutter环境所需依赖
+
+# 核心强化学习库
+stable-baselines3>=2.0.0
+sb3-contrib>=2.0.0  # 用于MaskablePPO
+gymnasium>=0.28.0
+
+# 环境和仿真
+mani-skill  # 已有环境
+sapien
+torch>=1.12.0
+numpy>=1.21.0
+
+# 日志和可视化
+tensorboard>=2.12.0
+matplotlib>=3.5.0
+opencv-python>=4.5.0
+
+# 其他工具
+tqdm>=4.64.0
+pandas>=1.5.0 
