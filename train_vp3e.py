@@ -34,13 +34,17 @@ def parse_args():
     # 课程采样
     p.add_argument("--tau", type=float, default=0.1)
     p.add_argument("--eta", type=float, default=0.05)
+    # 渐进式训练
+    p.add_argument("--warmup_epochs", type=int, default=30,
+                   help="Phase 1 感知预热轮数, 之后进入 Phase 2 因果端到端")
     return p.parse_args()
 
 
-def compute_loss(pred, batch, args):
+def compute_loss(pred, batch, args, use_causal: bool):
     """
     特权蒸馏损失:
-      L = w1·L_amodal + w2·L_graph + w3·L_stab + w4·L_pot
+      Phase 1: L = w1·L_amodal + w2·L_graph + w3·L_stab
+      Phase 2: L = w1·L_amodal + w2·L_graph + w3·L_stab + w4·L_pot
 
     所有 loss 均只在 mask=True 的有效节点上计算。
     """
@@ -49,23 +53,22 @@ def compute_loss(pred, batch, args):
     pair_mask = mask.unsqueeze(2) * mask.unsqueeze(1)  # [B, N, N]
     n_pairs = pair_mask.sum().clamp(min=1)
 
-    # L_amodal: MSE(bbox_pred, [gt_center, gt_volume])
     L_amodal = ((pred["bbox"] - batch["gt_bbox"]) ** 2 * mask.unsqueeze(-1)).sum() / n_valid
 
-    # L_graph: BCE(A_hat, GT_support_matrix)
     L_graph = F.binary_cross_entropy(
         pred["A_hat"] * pair_mask, batch["support_matrix"] * pair_mask,
         reduction="sum",
     ) / n_pairs
 
-    # L_stability: MSE
     L_stab = ((pred["stab_hat"] - batch["gt_stability"]) ** 2 * mask).sum() / n_valid
 
-    # L_potential: MSE
-    L_pot = ((pred["pot_hat"] - batch["gt_potentiality"]) ** 2 * mask).sum() / n_valid
+    total = args.w_amodal * L_amodal + args.w_graph * L_graph + args.w_stab * L_stab
 
-    total = (args.w_amodal * L_amodal + args.w_graph * L_graph
-             + args.w_stab * L_stab + args.w_pot * L_pot)
+    if use_causal:
+        L_pot = ((pred["pot_hat"] - batch["gt_potentiality"]) ** 2 * mask).sum() / n_valid
+        total = total + args.w_pot * L_pot
+    else:
+        L_pot = torch.tensor(0.0)
 
     return total, {
         "amodal": L_amodal.item(), "graph": L_graph.item(),
@@ -92,9 +95,13 @@ def main():
     print(f"VP3ENetwork: {n_params:,} params  device={device}")
     print(f"Dataset: {len(dataset)} samples  batch={args.batch_size}")
     print(f"Loss weights: amodal={args.w_amodal} graph={args.w_graph} "
-          f"stab={args.w_stab} pot={args.w_pot}\n")
+          f"stab={args.w_stab} pot={args.w_pot}")
+    print(f"Progressive: warmup={args.warmup_epochs} epochs → then joint\n")
 
     for epoch in range(1, args.epochs + 1):
+        use_causal = epoch > args.warmup_epochs
+        phase = "Phase 2: Joint-Tuning" if use_causal else "Phase 1: Warm-up"
+
         model.train()
         epoch_losses = {"amodal": 0, "graph": 0, "stab": 0, "pot": 0, "total": 0}
         n_batches = 0
@@ -104,15 +111,16 @@ def main():
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
 
-            pred = model(batch["obs_point_clouds"], batch["mask"])
-            loss, loss_dict = compute_loss(pred, batch, args)
+            pred = model(batch["obs_point_clouds"], batch["mask"],
+                         use_causal=use_causal)
+            loss, loss_dict = compute_loss(pred, batch, args,
+                                           use_causal=use_causal)
 
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
-            # 更新 LP Sampler
             bucket_ids = batch["bucket_idx"]
             for b_idx in bucket_ids.unique():
                 sampler.update_loss(b_idx.item(), loss_dict["total"])
@@ -128,8 +136,8 @@ def main():
         w = sampler.get_sampling_weights()
         dt = time.time() - t0
 
-        if epoch <= 3 or epoch % 5 == 0 or epoch == args.epochs:
-            print(f"[Epoch {epoch:3d}/{args.epochs}]  "
+        if epoch <= 3 or epoch % 5 == 0 or epoch == args.epochs or epoch == args.warmup_epochs + 1:
+            print(f"[{phase}] Epoch {epoch:3d}/{args.epochs}  "
                   f"loss={avg['total']:.4f}  "
                   f"amodal={avg['amodal']:.4f}  graph={avg['graph']:.4f}  "
                   f"stab={avg['stab']:.4f}  pot={avg['pot']:.4f}  "

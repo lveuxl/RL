@@ -2401,7 +2401,128 @@ _**Assistant**_
 
 收到，爱学习的小龙虾！
 
-这是整个 V-P3E 系统的收官之作。让我先完整审视所有现有模块的接口，确保最终整合精确无
+这是整个 V-P3E 系统的收官之作。让我先完整审视所有现有模块的接口，确保最终整合精确无误。
+
+---
+
+
+
+---
+
+
+
+---
+
+<think><details><summary>Thought Process</summary>Now I need to:
+
+1. Add `CausalSTIT` module to `vp3e_modules.py` - Transformer-based counterfactual reasoning
+2. Add `VP3ENetwork` that wraps everything together
+3. Write `train_vp3e.py` with the training loop
+
+Let me think about `CausalSTIT` carefully:
+
+**Input**: Z [B, N, D] - physical fused features, mask [B, N]
+
+**Key operation**: For each node i, we want to evaluate "what happens if node i is removed?"
+- Method: Use a Transformer Encoder with attention masking
+
+
+- For each target node i: mask it out of the attention (other nodes can't see it), then pool the remaining nodes and predict a scalar
+
+The challenge is computing this efficiently for all N nodes without running N separate forward passes. I'm thinking about using a batched approach where I create attention masks in parallel for each node position, run them through the transformer encoder simultaneously, then pool and project each to a scalar output.
+
+The most practical approach seems to be using a learnable [MASK] token to replace the target node, then looping through each node position at inference time to generate the full [B, N] output—this balances memory efficiency with implementation simplicity. For B=4 and N=54, that's 216 sequences total—very manageable. Now I need to set up the attention masking properly: for each intervention i, I want to mask out position i itself plus any padding positions, so the key padding mask will mark those positions as True to ignore them. Let me start implementing the module.
+
+Defining the CausalSTIT class... I'm setting up the forward pass by unpacking the input dimensions, then adding positional embeddings to the features. Next, I'm expanding the input to create a batch where each position gets masked individually—I duplicate the sequence N times and replace each diagonal element with a mask token so the transformer can predict what was removed. Then I'm reshaping everything for batch processing through the transformer.
+
+Now I'm building the attention mask to handle both padding positions and the intervention targets themselves, combining them into a single mask that prevents the transformer from attending to masked positions.
+
+Continuing with the transformer forward pass...
+
+Then I'm pooling the output by masking out invalid positions and computing a weighted average across the remaining valid nodes, feeding that through the MLP head to produce the final intervention potentials, which get passed through a sigmoid to return probabilities.
+
+Now I'm checking the memory footprint—for a batch of 4 with 54 nodes, the expanded tensor and attention matrices should fit comfortably on GPU, though I'm realizing the expand and clone operations might be inefficient and worth optimizing with a smarter approach that avoids the full expansion. I'll keep the full N approach for simplicity. Now thinking through the training loop: the forward pass returns all predictions in a dict, and the loss combines four terms. I need to load data from the LP sampler, run the forward pass, compute loss, and update. But looking at what the dataset actually provides—observation point clouds, support matrix, stability and potentiality ground truth, complexity, mask, and bucket index—I notice it's missing poses and volumes, which I need for the amodal loss term.
+
+I need to update the dataset to include poses and volumes. The user is asking for the core logic in PyTorch along with a training example, so I should modify the dataset, add the CausalSTIT and VP3ENetwork modules, and write out the training loop. Let me be careful with how I design the CausalSTIT component.
+
+The attention computation is actually quite manageable—with B=4 and N=54, we're looking at around 630K operations, which is very light for a GPU. I'll use batch_first=True in the transformer layer for cleaner code. Now I'll write out the complete implementation, starting with updating the dataset to provide the ground truth poses and volumes that the network needs.</details></think>
+
+---
+
+接口全部确认完毕。需要三处改动：
+1. `jenga_dataloader.py` — 补充 `gt_bbox`（poses + volumes，供 amodal loss 使用）
+2. `vp3e_modules.py` — 追加 `CausalSTIT` + `VP3ENetwork`
+3. 新建 `train_vp3e.py` — 完整训练循环
+
+---
+
+## Todo List
+
+- [-] 更新 JengaDataset 补充 gt_bbox (poses+volumes)
+- [ ] 实现 CausalSTIT 模块 (Transformer + counterfactual masking)
+- [ ] 实现 VP3ENetwork 封装
+- [ ] 编写 train_vp3e.py 训练循环
+- [ ] 端到端验证
+
+---
+
+
+
+---
+
+## Todo List
+
+- [x] 更新 JengaDataset 补充 gt_bbox (poses+volumes)
+- [-] 实现 CausalSTIT 模块 (Transformer + counterfactual masking)
+- [ ] 实现 VP3ENetwork 封装
+- [ ] 编写 train_vp3e.py 训练循环
+- [ ] 端到端验证
+
+---
+
+现在实现 CausalSTIT 和 VP3ENetwork。核心设计思考：
+
+**CausalSTIT 的反事实干预**：对每个节点 i，将 Z 中位置 i 替换为可学习的 `[MASK]` token，构造 attention mask 让 i 对其他节点不可见，然后 transformer 编码 → 池化剩余节点 → MLP 预测。通过把 B 个样本的 N 个干预同时展开为 `[B*N, N, D]` 的 batch，一次 transformer forward 搞定全部干预。
+
+---
+
+
+
+---
+
+
+
+---
+
+## Todo List
+
+- [x] 更新 JengaDataset 补充 gt_bbox (poses+volumes)
+- [x] 实现 CausalSTIT 模块
+- [x] 实现 VP3ENetwork 封装
+- [-] 编写 train_vp3e.py 训练循环
+- [ ] 端到端验证
+
+---
+
+
+
+---
+
+
+
+---
+
+## Todo List
+
+- [x] 更新 JengaDataset 补充 gt_bbox (poses+volumes)
+- [x] 实现 CausalSTIT 模块
+- [x] 实现 VP3ENetwork 封装
+- [x] 编写 train_vp3e.py 训练循环
+- [-] 端到端验证
+
+---
+
+端到端验证：跑 3 个 epoch 确认所有模块正确衔接、loss 下降、梯度回传、LP 采样更新。
 
 ---
 
@@ -2414,6 +2535,233 @@ _**Assistant**_
 ---
 
 
+
+---
+
+还在运行，没有输出。CausalSTIT 的 B*N 展开（4*54=216 个序列）在 CPU 上较慢。让我用更小的 batch 和减少 epoch_size。
+
+---
+
+
+
+---
+
+
+
+---
+
+CPU 上 CausalSTIT 的 B*N=216 个序列的 transformer 太慢了。我用一个更快的验证方式：小 batch + 手动限制 epoch_size + 验证形状和梯度。
+
+---
+
+
+
+---
+
+## Todo List
+
+- [x] 更新 JengaDataset 补充 gt_bbox (poses+volumes)
+- [x] 实现 CausalSTIT 模块
+- [x] 实现 VP3ENetwork 封装
+- [x] 编写 train_vp3e.py 训练循环
+- [x] 端到端验证
+
+---
+
+全部验证通过。以下是完整总结：
+
+---
+
+## 修改文件
+
+### 1. `jenga_dataloader.py` — 补充 `gt_bbox`
+
+新增返回 `gt_bbox: [M, 4]` = `[cx, cy, cz, volume]`，供 L_amodal 使用。
+
+### 2. `vp3e_modules.py` — 新增 CausalSTIT + VP3ENetwork
+
+#### CausalSTIT — 反事实结构干预 Transformer
+
+核心设计：对每个节点 i 执行"如果移除 i 会怎样"的推理。
+
+```
+Z [B, N, D]  + 位置编码
+  → 展开为 B*N 个序列, 每个序列中位置 i 替换为 [MASK] token
+  → Transformer Encoder (1 层, 4 头)
+      src_key_padding_mask: 屏蔽 padding + 干预目标 i
+  → Mean-pool 剩余有效节点
+  → MLP → sigmoid → pot_hat [B, N]
+```
+
+**关键技巧**：将 N 个干预展开为 `[B*N, N, D]` 的 batch，一次 transformer forward 完成全部 N 个反事实推理，避免 N 次循环。
+
+#### VP3ENetwork — 端到端封装
+
+```
+pcd [B,N,K,3] → InstancePerception → F0 [B,N,128] + bbox [B,N,4]
+                 ImplicitTopology  → A_hat [B,N,N]
+                 PhysicalMsgPass   → Z [B,N,128]
+                 StabilityHead     → stab_hat [B,N]
+                 CausalSTIT        → pot_hat [B,N]
+```
+
+#### 参数量
+
+| 模块 | 参数 |
+|------|------|
+| InstancePerception | 33,604 |
+| ImplicitTopology | 57,601 |
+| PhysicalMessagePassing (3层) | 148,992 |
+| StabilityHead | 8,321 |
+| **CausalSTIT** | **147,841** |
+| **总计** | **396,359** |
+
+### 3. `train_vp3e.py` — 训练循环
+
+**损失函数**（特权蒸馏）：
+
+$$\mathcal{L} = w_1 \cdot \underbrace{\text{MSE}(\hat{\text{bbox}}, \text{GT})}_{\mathcal{L}_{\text{amodal}}} + w_2 \cdot \underbrace{\text{BCE}(\hat{\mathcal{A}}, \text{GT}_{\text{sup}})}_{\mathcal{L}_{\text{graph}}} + w_3 \cdot \underbrace{\text{MSE}(\hat{p}_{\text{stab}}, \text{GT})}_{\mathcal{L}_{\text{stab}}} + w_4 \cdot \underbrace{\text{MSE}(\hat{p}_{\text{pot}}, \text{GT})}_{\mathcal{L}_{\text{pot}}}$$
+
+**训练循环关键步骤**：
+1. `LPCurriculumSampler` 按桶权重采样 batch
+2. `VP3ENetwork.forward` 一次产生所有预测
+3. `compute_loss` 在 mask 有效节点上计算 4 项 loss
+4. 反向传播 + 梯度裁剪（max_norm=5.0）
+5. `sampler.update_loss(bucket_idx, loss)` 更新 EMA
+6. Epoch 末 `sampler.snapshot()` 重算采样权重 + CosineAnnealing 学习率
+
+**验证结果**：2 步优化后 L_stab 从 0.1762 降至 0.1364，所有模块梯度正常回传，padding 节点严格为零。
+
+---
+
+_**User**_
+
+我目前的 train_vp3e.py 是纯端到端联合训练所有模块的。但在训练初期，感知基座输出的图结构全都是噪声，此时强制 CausalSTIT 在乱码上做推演，会导致梯度爆炸和表征坍塌。
+
+Task:
+请帮我修改现有的 vp3e_modules.py 和 train_vp3e.py，实现**“感知预热，因果微调的渐进式端到端范式 (Progressive End-to-End Training)”**。具体要求如下：
+
+1. 修改 vp3e_modules.py：
+
+在 VP3ENetwork 的 forward 方法中增加一个参数 use_causal=True。
+
+当 use_causal=False 时，直接跳过 self.causal(Z, mask) 的前向传播，并在返回的字典中让 pot_hat 为 None 或全零张量（以节省显存和计算开销）。
+
+2. 修改 train_vp3e.py：
+
+在 parse_args 中增加一个参数 --warmup_epochs（默认设为 30）。
+
+Phase 1 (Epoch <= warmup_epochs) - 感知预热: >   * 前向传播时设置 use_causal=False。
+
+损失函数只计算 L_amodal, L_graph, L_stab。强迫网络先学好物理流形。
+
+Phase 2 (Epoch > warmup_epochs) - 因果端到端: >   * 前向传播时设置 use_causal=True。
+
+损失函数加入 L_pot，此时整个网络端到端联合训练。L_pot 的梯度需要能够一路穿透 CausalSTIT 回传到感知基座的 GNN 和 PointNet 中。
+
+在 Terminal 的打印输出中，明确标示出当前处于 [Phase 1: Warm-up] 还是 [Phase 2: Joint-Tuning]。
+
+---
+
+_**Assistant**_
+
+收到，爱学习的小龙虾！
+
+需求非常清晰，改动量小且精准。两个文件各改一处。
+
+---
+
+
+
+---
+
+
+
+---
+
+现在修改 `train_vp3e.py`。
+
+---
+
+
+
+---
+
+三处精准改动：`parse_args` 加参数、`compute_loss` 条件化 L_pot、`main` 循环加 phase 逻辑。
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+快速验证两个 phase 的行为差异。
+
+---
+
+
+
+---
+
+## Todo List
+
+- [x] 更新 JengaDataset 补充 gt_bbox (poses+volumes)
+- [x] 实现 CausalSTIT 模块
+- [x] 实现 VP3ENetwork 封装
+- [x] 编写 train_vp3e.py 训练循环
+- [x] 端到端验证
+
+---
+
+所有改动验证通过。总共只改了 **3 处**：
+
+---
+
+## 改动汇总
+
+### 1. `vp3e_modules.py` — `VP3ENetwork.forward` 加 `use_causal` 参数
+
+```305:316:/Users/jianzihang/Downloads/RL_Robot/vp3e_modules.py
+    def forward(self, pcd: torch.Tensor, mask: torch.Tensor, use_causal: bool = True):
+        F0, bbox = self.perception(pcd, mask)
+        A_hat    = self.topology(F0, mask)
+        Z        = self.gnn(F0, A_hat, mask)
+        stab_hat = self.stab_head(Z, mask)
+        pot_hat  = self.causal(Z, mask) if use_causal else torch.zeros_like(stab_hat)
+        # ...
+```
+
+`use_causal=False` 时：CausalSTIT 完全不参与前向计算，`pot_hat` 为零张量，无梯度流经 `self.causal`。
+
+### 2. `train_vp3e.py` — `compute_loss` 条件化 L_pot
+
+Phase 1 只累加 `L_amodal + L_graph + L_stab`，Phase 2 额外加 `L_pot`。L_pot 的梯度**完整穿透**回 CausalSTIT → GNN → PointNet。
+
+### 3. `train_vp3e.py` — 主循环 phase 切换
+
+```python
+use_causal = epoch > args.warmup_epochs
+phase = "Phase 2: Joint-Tuning" if use_causal else "Phase 1: Warm-up"
+```
+
+**验证结果**：
+
+| 指标 | Phase 1 (Warm-up) | Phase 2 (Joint-Tuning) |
+|------|-------------------|----------------------|
+| pot_hat | 全零 | `[0, 0.34]` 正常预测 |
+| CausalSTIT 梯度 | **0** (完全隔离) | 279.7 (正常回
 
 ---
 

@@ -302,12 +302,12 @@ class VP3ENetwork(nn.Module):
         self.stab_head  = StabilityHead(feat_dim)
         self.causal     = CausalSTIT(feat_dim, n_heads, max_blocks)
 
-    def forward(self, pcd: torch.Tensor, mask: torch.Tensor):
+    def forward(self, pcd: torch.Tensor, mask: torch.Tensor, use_causal: bool = True):
         F0, bbox = self.perception(pcd, mask)
         A_hat    = self.topology(F0, mask)
         Z        = self.gnn(F0, A_hat, mask)
         stab_hat = self.stab_head(Z, mask)
-        pot_hat  = self.causal(Z, mask)
+        pot_hat  = self.causal(Z, mask) if use_causal else torch.zeros_like(stab_hat)
 
         return {
             "F0": F0, "bbox": bbox, "A_hat": A_hat,
