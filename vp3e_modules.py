@@ -98,7 +98,8 @@ class ImplicitTopology(nn.Module):
 
         # mask: 只有 (有效i, 有效j) 对才有意义
         pair_mask = mask.unsqueeze(2) & mask.unsqueeze(1)  # [B, N, N]
-        logit = logit.masked_fill(~pair_mask, -1e9)
+        fill_value = -1e9 if logit.dtype == torch.float32 else -65000
+        logit = logit.masked_fill(~pair_mask, fill_value)
 
         return torch.sigmoid(logit)
 

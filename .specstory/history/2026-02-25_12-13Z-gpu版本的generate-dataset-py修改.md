@@ -106,3 +106,159 @@ _**Assistant**_
 
 ---
 
+关键发现！GPU模式下：
+- `get_contacts()` 不可用（只在CPU模式下）
+- 但有 `get_pairwise_contact_forces(obj1, obj2)` 可以在GPU模式下工作，返回 `(N, 3)` 力向量
+- `get_sim_state()` / `set_sim_state()` 在GPU模式下也支持并行
+
+现在我有了完整的设计方案。核心架构：
+
+1. **并行reset塔**：1024个环境同时设置不同层数+不同drop配置
+2. **并行collapse检测**：用张量操作批量检查
+3. **并行 support graph**：用 `get_pairwise_contact_forces` 构建
+4. **并行 complexity 过滤**：张量操作
+5. **存活环境逐个采集 stability / potentiality / 点云**：这些必须CPU-side，但通过大批量过滤减少实际需要采集的数量
+6. **点云渲染**：GPU模式下不支持camera sensor，改用纯pose采集（或用CPU回退采集）
+
+让我再确认一下GPU模式下sensor/render的限制。
+
+---
+
+
+
+---
+
+好的，GPU模式下 camera sensor 是支持的（有 `_gpu_setup_sensors`）。但渲染在GPU并行模式下，1024个环境的渲染会产生巨大显存开销。
+
+让我现在实现完整的GPU并行版本。核心策略：
+
+**第一阶段（GPU并行）**：批量 reset → 批量 collapse 检查 → 批量 complexity 计算（用 pairwise contact forces 构建 support graph 的并行版）→ 过滤出合格环境
+
+**第二阶段（CPU回退采集）**：对合格环境，用单独的CPU环境逐个采集 stability、potentiality、点云
+
+这样第一阶段高效过滤（大量塔会因坍塌或复杂度不匹配被跳过），第二阶段只对少量合格塔做精确采集。
+
+---
+
+
+
+---
+
+
+
+---
+
+## Todo List
+
+- [x] 阅读 jenga_tower.py 理解环境API、support_graph、stability、potentiality、render等接口
+- [x] 阅读 generate_dataset.py 完整逻辑，理解串行流程
+- [x] 设计GPU并行版本架构
+- [x] 实现 generate_dataset_gpu.py
+- [x] 检查lint错误并修复
+
+---
+
+文件已创建。下面是设计总结：
+
+---
+
+## `generate_dataset_gpu.py` 设计架构
+
+### 两阶段 Pipeline
+
+**阶段 1 — GPU 批量筛选 (1024 环境并行)**
+
+| 步骤 | 操作 | 并行方式 |
+|---|---|---|
+| 1 | `batch_reset_tower` | 1024 个环境同时设置不同层数 + drop 配置，通过张量广播一次性设置所有 block 的 pose/velocity |
+| 2 | `batch_check_collapse` | 批量检查顶层 block 的 Z 坐标偏移 |
+| 3 | `batch_build_support_graph` | 用 `get_pairwise_contact_forces(block_i, block_j)` 一次查询所有 B 个环境的接触力，构建 support matrix |
+| 4 | `calculate_topology_complexity` | 逐环境计算复杂度，过滤不在目标桶范围的 |
+
+**阶段 2 — CPU 精确采集 (仅对通过筛选的环境)**
+
+对每个候选样本，用独立的 `CPUCollector` 单环境精确重建塔构型，然后调用原始的 `get_support_graph` / `get_gt_stability` / `get_gt_potentiality` / `render_point_cloud`。
+
+### 关键设计决策
+
+1. **为什么需要 CPU 回退？**
+   - `get_gt_potentiality` 需要反事实干预（逐个移除 block → 模拟 → 恢复），这在 GPU 模式下会干扰其他并行环境的状态
+   - `render_point_cloud` 依赖 camera segmentation 精确分割，CPU 模式下最稳定
+   - `get_contacts()` 返回详细接触点信息（含 impulse 方向），比 `get_pairwise_contact_forces` 更精确
+
+2. **加速效果来自哪里？**
+   - 原版 CPU 串行中，大量时间浪费在 reset → collapse → complexity 不匹配的"废弃循环"上
+   - GPU 版一次性并行处理 1024 个塔，批量淘汰坍塌的和复杂度不达标的
+   - 只有通过筛选的少量样本才进入耗时的阶段 2
+
+3. **`batch_build_support_graph`**
+   - 利用 `get_pairwise_contact_forces(block_i, block_j)` 返回 `(B, 3)` 的力向量
+   - 遍历所有 block pair（最多 54×53/2 = 1431 对），但每次调用同时获得 1024 个环境的结果
+
+### 修改的文件
+
+| 文件 | 变更 |
+|---|---|
+| `generate_dataset_gpu.py` | **新建** — GPU 并行版数据生成脚本 |
+
+### 运行方式
+
+```bash
+conda activate /opt/anaconda3/envs/skill
+python generate_dataset_gpu.py --per_bucket 1000 --num_envs 1024 --out dataset_jenga_3000.h5
+```
+
+如果显存不够 1024，可以降低 `--num_envs`（如 256 或 512）。
+
+---
+
+_**User**_
+
+对阶段 2 进行改造：
+
+多进程化 (Multiprocessing)： 这是最立竿见影的改法。使用 concurrent.futures.ProcessPoolExecutor，将 candidates 分发给多个 CPU worker（比如开 16 或 32 个进程）同时执行 collect_sample。这能直接将阶段 2 的耗时缩小一个数量级。
+
+点云渲染 GPU 化： 如果可能，将点云采集也放到 ManiSkill 的 GPU backend 中完成，避免将相机渲染任务转移给 CPU 串行处理。
+
+---
+
+_**Assistant**_
+
+收到，爱学习的小龙虾！
+
+这是一个复杂的改造，我需要先完整理解当前的 `generate_dataset_gpu.py` 代码，以及 ManiSkill GPU 渲染的能力边界。
+
+---
+
+
+
+---
+
+现在让我深入理解 ManiSkill GPU 模式下 camera/render 的能力，以及 `get_gt_potentiality` 的并行化可行性。
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+

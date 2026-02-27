@@ -55,9 +55,9 @@ def compute_loss(pred, batch, args, use_causal: bool):
 
     L_amodal = ((pred["bbox"] - batch["gt_bbox"]) ** 2 * mask.unsqueeze(-1)).sum() / n_valid
 
+    a_pred = (pred["A_hat"] * pair_mask).clamp(1e-7, 1 - 1e-7)
     L_graph = F.binary_cross_entropy(
-        pred["A_hat"] * pair_mask, batch["support_matrix"] * pair_mask,
-        reduction="sum",
+        a_pred, batch["support_matrix"] * pair_mask, reduction="sum",
     ) / n_pairs
 
     L_stab = ((pred["stab_hat"] - batch["gt_stability"]) ** 2 * mask).sum() / n_valid

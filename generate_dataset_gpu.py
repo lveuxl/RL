@@ -1,17 +1,20 @@
 """
-GPU 并行版离线数据生成 Pipeline — 1024 个环境同时仿真
+GPU 并行版离线数据生成 Pipeline — 全 GPU 渲染 + 多进程 CPU 采集
 
-利用 ManiSkill GPU 后端 + PyTorch 张量操作:
-  阶段 1 (GPU, 批量): reset → collapse 检查 → support graph → complexity 过滤
-  阶段 2 (CPU, 逐个): 对通过过滤的环境提取 stability / potentiality / 点云
+三阶段流水线:
+  阶段 1 (GPU, 批量): reset → collapse → support graph → complexity 过滤
+  阶段 1.5 (GPU, 批量): 多视角点云渲染, 一次拍摄 B 个环境
+  阶段 2 (多进程 CPU): stability + potentiality 并行计算
 
 Usage:
     conda activate /opt/anaconda3/envs/skill
-    python generate_dataset_gpu.py [--per_bucket 1000] [--num_envs 1024] [--out dataset_jenga_3000.h5]
+    python generate_dataset_gpu.py --per_bucket 10000 --num_envs 1024 --workers 16
 """
 import argparse
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp # 导入 mp
 
 import gymnasium as gym
 import h5py
@@ -22,7 +25,7 @@ from jenga_tower import (
     BLOCK_H, BLOCK_W, BLOCK_L, BLOCK_DENSITY,
     NUM_LEVELS, NUM_BLOCKS,
     get_gt_stability, get_gt_potentiality,
-    render_point_cloud, calculate_topology_complexity,
+    calculate_topology_complexity,
 )
 from mani_skill.utils.structs.pose import Pose
 
@@ -41,36 +44,26 @@ def parse_args():
     p.add_argument("--out", type=str, default="dataset_jenga_3000.h5")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--num_envs", type=int, default=1024)
+    p.add_argument("--workers", type=int, default=16,
+                   help="CPU worker 进程数 (potentiality 并行)")
     p.add_argument("--collapse_threshold", type=float, default=0.03)
     p.add_argument("--flush_every", type=int, default=100)
     return p.parse_args()
 
 
-# ── GPU 并行塔操作 ──
+# ─────────────────────────────────────────────────────
+#  阶段 1: GPU 并行塔操作
+# ─────────────────────────────────────────────────────
 
 def batch_reset_tower(uw, num_layers_per_env, rng, p_drop_per_env, device):
-    """
-    并行 reset 所有环境的塔。
-
-    Args:
-        uw: unwrapped env (num_envs=B)
-        num_layers_per_env: (B,) int array, 每个环境的层数
-        rng: numpy RNG
-        p_drop_per_env: (B,) float array, 每个环境的 drop 比例
-        device: torch device
-
-    Returns:
-        active_masks: (B, NUM_BLOCKS) bool tensor, 哪些 block 是 active 的
-    """
+    """并行 reset B 个环境的塔, 返回 active_masks (B, NUM_BLOCKS)。"""
     B = uw.num_envs
     gap_w, gap_h = uw.gap_w, uw.gap_h
     cx, cy = 0.2, 0.0
 
     far = torch.tensor([500.0, 500.0, 0.1], device=device)
     zero3 = torch.zeros(3, device=device)
-
     num_layers_t = torch.tensor(num_layers_per_env, device=device, dtype=torch.long)
-
     active_masks = torch.zeros(B, NUM_BLOCKS, dtype=torch.bool, device=device)
 
     for level in range(NUM_LEVELS):
@@ -78,31 +71,27 @@ def batch_reset_tower(uw, num_layers_per_env, rng, p_drop_per_env, device):
         for i in range(3):
             idx = level * 3 + i
             b = uw.blocks[idx]
-
-            env_has_level = num_layers_t > level  # (B,)
+            env_has_level = num_layers_t > level
 
             offset = (i - 1) * (0.05 + gap_w)
-            if level % 2 == 0:
-                pos_val = torch.tensor([cx, cy + offset, z], device=device)
-            else:
-                pos_val = torch.tensor([cx + offset, cy, z], device=device)
+            pos_val = torch.tensor(
+                [cx, cy + offset, z] if level % 2 == 0 else [cx + offset, cy, z],
+                device=device,
+            )
 
-            # 所有 env 先设置到远处
-            pos_all = far.unsqueeze(0).expand(B, -1).clone()  # (B, 3)
+            pos_all = far.unsqueeze(0).expand(B, -1).clone()
             pos_all[env_has_level] = pos_val
 
             b.set_pose(Pose.create_from_pq(pos_all))
             vel = zero3.unsqueeze(0).expand(B, -1)
             b.set_linear_velocity(vel)
             b.set_angular_velocity(vel)
-
             active_masks[:, idx] = env_has_level
 
-    # 让塔沉降
     for _ in range(20):
         uw.scene.step()
 
-    # 并行 drop blocks
+    # drop blocks (per-env random)
     for env_i in range(B):
         total_active = int(num_layers_per_env[env_i]) * 3
         removable = list(range(3, total_active))
@@ -111,24 +100,21 @@ def batch_reset_tower(uw, num_layers_per_env, rng, p_drop_per_env, device):
         n_drop = int(len(removable) * p_drop_per_env[env_i])
         if n_drop == 0:
             continue
-        drop_ids = sorted(rng.choice(removable, n_drop, replace=False).tolist())
-        for rid in drop_ids:
+        for rid in sorted(rng.choice(removable, n_drop, replace=False).tolist()):
             active_masks[env_i, rid] = False
 
-    # 把 inactive blocks 移走 (按 block 维度遍历, 每个 block 一次批量操作)
     for idx in range(NUM_BLOCKS):
         b = uw.blocks[idx]
-        inactive_envs = ~active_masks[:, idx]  # (B,)
-        if not inactive_envs.any():
+        inactive = ~active_masks[:, idx]
+        if not inactive.any():
             continue
-        cur_pos = b.pose.p.clone()  # (B, 3)
-        cur_pos[inactive_envs] = far
+        cur_pos = b.pose.p.clone()
+        cur_pos[inactive] = far
         b.set_pose(Pose.create_from_pq(cur_pos))
         vel = torch.zeros(B, 3, device=device)
         b.set_linear_velocity(vel)
         b.set_angular_velocity(vel)
 
-    # 沉降
     for _ in range(50):
         uw.scene.step()
 
@@ -136,16 +122,10 @@ def batch_reset_tower(uw, num_layers_per_env, rng, p_drop_per_env, device):
 
 
 def batch_check_collapse(uw, active_masks, num_layers_per_env, threshold, device):
-    """
-    并行检查每个环境的塔是否坍塌。
-
-    Returns:
-        collapsed: (B,) bool tensor
-    """
+    """并行 collapse 检测, 返回 (B,) bool tensor。"""
     B = uw.num_envs
     gap_h = uw.gap_h
     collapsed = torch.zeros(B, dtype=torch.bool, device=device)
-
     num_layers_t = torch.tensor(num_layers_per_env, device=device, dtype=torch.long)
 
     for env_i in range(B):
@@ -163,13 +143,7 @@ def batch_check_collapse(uw, active_masks, num_layers_per_env, threshold, device
 
 
 def batch_build_support_graph(uw, active_masks, device):
-    """
-    用 get_pairwise_contact_forces 为所有环境并行构建 support graph。
-
-    Returns:
-        list of dicts (len = B), 每个 dict 同 get_support_graph 返回格式, 但只包含 active blocks。
-        如果某个环境查询失败则返回 None。
-    """
+    """GPU 并行构建所有环境的 support graph, 返回 list[dict | None]。"""
     B = uw.num_envs
     dt = uw.scene.timestep
     vol = BLOCK_L * BLOCK_W * BLOCK_H
@@ -177,25 +151,22 @@ def batch_build_support_graph(uw, active_masks, device):
 
     results = [None] * B
 
-    # 收集每个环境的 active block indices
     all_active_ids = []
     for env_i in range(B):
-        ids = active_masks[env_i].nonzero(as_tuple=True)[0].cpu().tolist()
-        all_active_ids.append(ids)
+        all_active_ids.append(
+            active_masks[env_i].nonzero(as_tuple=True)[0].cpu().tolist()
+        )
 
-    # 预计算所有 block pair 的 pairwise contact forces (GPU 批量)
-    # 遍历所有可能的 block pair, 查询力
+    # GPU 批量查询所有 block pair 接触力
     pair_forces = {}
     for i in range(NUM_BLOCKS):
         for j in range(i + 1, NUM_BLOCKS):
-            # 只在至少一个环境里两个 block 都 active 时才查询
             both_active = active_masks[:, i] & active_masks[:, j]
             if not both_active.any():
                 continue
-            forces = uw.scene.get_pairwise_contact_forces(
+            pair_forces[(i, j)] = uw.scene.get_pairwise_contact_forces(
                 uw.blocks[i], uw.blocks[j]
-            )  # (B, 3)
-            pair_forces[(i, j)] = forces
+            )
 
     for env_i in range(B):
         aids = all_active_ids[env_i]
@@ -205,7 +176,6 @@ def batch_build_support_graph(uw, active_masks, device):
 
         volumes = [vol] * n
         heights = [uw.blocks[aid].pose.p[env_i, 2].item() for aid in aids]
-
         aid_to_local = {aid: li for li, aid in enumerate(aids)}
         support_matrix = [[0] * n for _ in range(n)]
 
@@ -214,7 +184,6 @@ def batch_build_support_graph(uw, active_masks, device):
                 continue
             li, lj = aid_to_local[gi], aid_to_local[gj]
             fz = forces[env_i, 2].item() / dt
-
             if -fz > threshold:
                 support_matrix[li][lj] = 1
             if fz > threshold:
@@ -230,7 +199,186 @@ def batch_build_support_graph(uw, active_masks, device):
     return results
 
 
-# ── HDF5 写入 (同 CPU 版) ──
+# ─────────────────────────────────────────────────────
+#  阶段 1.5: GPU 并行点云渲染
+# ─────────────────────────────────────────────────────
+
+def batch_render_point_cloud(uw, active_masks, candidate_env_indices, rng):
+    """
+    GPU 模式下一次渲染所有环境, 按 candidate 索引提取点云。
+
+    Returns:
+        dict: env_i → obs_point_clouds (N_active, N_PTS, 6)
+    """
+    scene = uw.scene
+    surround_cams = {
+        uid: s for uid, s in scene.sensors.items()
+        if uid.startswith("surround")
+    }
+
+    scene.update_render(update_sensors=True, update_human_render_cameras=False)
+    for sensor in surround_cams.values():
+        sensor.capture()
+
+    # 收集所有相机的原始数据 (保持在 GPU tensor 上)
+    all_pos, all_rgb, all_seg, all_c2w = [], [], [], []
+    for cam_uid, sensor in surround_cams.items():
+        images = sensor.get_obs(rgb=True, position=True, segmentation=True)
+        params = sensor.get_params()
+        all_pos.append(images["position"].float() / 1000.0)   # (B,H,W,3)
+        all_rgb.append(images["rgb"].float())                  # (B,H,W,3)
+        all_seg.append(images["segmentation"])                 # (B,H,W,1)
+        all_c2w.append(params["cam2world_gl"])                 # (B,4,4)
+
+    # 构建 per_scene_id → block 全局索引 的映射
+    block_sids = [blk._objs[0].per_scene_id for blk in uw.blocks]
+
+    result = {}
+    for env_i in candidate_env_indices:
+        aids = active_masks[env_i].nonzero(as_tuple=True)[0].cpu().tolist()
+        n_active = len(aids)
+        if n_active == 0:
+            result[env_i] = np.zeros((0, N_PTS, 6), dtype=np.float32)
+            continue
+
+        # 该环境的 active block sid set
+        active_sids = {block_sids[idx] for idx in aids}
+        sid_to_local = {block_sids[aids[li]]: li for li in range(n_active)}
+
+        env_xyz_list, env_rgb_list, env_seg_list = [], [], []
+
+        for cam_i in range(len(all_pos)):
+            pos = all_pos[cam_i]   # (B,H,W,3)
+            rgb = all_rgb[cam_i]   # (B,H,W,3)
+            seg = all_seg[cam_i]   # (B,H,W,1)
+            c2w = all_c2w[cam_i]   # (B,4,4)
+
+            B_cam, H, W, _ = pos.shape
+            pos_e = pos[env_i]     # (H,W,3)
+            seg_e = seg[env_i, :, :, 0]  # (H,W)
+            rgb_e = rgb[env_i]     # (H,W,3)
+
+            valid = seg_e != 0
+            if not valid.any():
+                continue
+
+            ones = torch.ones(H, W, 1, device=pos_e.device, dtype=pos_e.dtype)
+            pts_homo = torch.cat([pos_e, ones], dim=-1).reshape(-1, 4)  # (H*W, 4)
+            pts_world = (pts_homo @ c2w[env_i].T)[:, :3]  # (H*W, 3)
+
+            valid_flat = valid.reshape(-1)
+            env_xyz_list.append(pts_world[valid_flat].cpu().numpy())
+            env_seg_list.append(seg_e.reshape(-1)[valid_flat].cpu().numpy().astype(int))
+
+            rgb_flat = rgb_e.reshape(-1, 3)[valid_flat].cpu().numpy()
+            env_rgb_list.append(rgb_flat / 255.0 if rgb_flat.max() > 1.0 else rgb_flat)
+
+        if not env_xyz_list:
+            result[env_i] = np.zeros((n_active, N_PTS, 6), dtype=np.float32)
+            continue
+
+        global_xyz = np.concatenate(env_xyz_list)
+        global_rgb = np.concatenate(env_rgb_list)
+        global_seg = np.concatenate(env_seg_list)
+        global_pcd = np.concatenate([global_xyz, global_rgb], axis=1)
+
+        obs_pcd = np.zeros((n_active, N_PTS, 6), dtype=np.float32)
+        for sid, li in sid_to_local.items():
+            mask = global_seg == sid
+            if not mask.any():
+                continue
+            pc = global_pcd[mask]
+            if len(pc) > N_PTS:
+                obs_pcd[li] = pc[rng.choice(len(pc), N_PTS, replace=False)]
+            else:
+                obs_pcd[li, :len(pc)] = pc
+
+        result[env_i] = obs_pcd
+
+    return result
+
+
+# ─────────────────────────────────────────────────────
+#  阶段 2: 多进程 CPU — potentiality + stability
+# ─────────────────────────────────────────────────────
+
+def _worker_collect(task):
+    """
+    独立进程 worker: 创建 CPU 环境 → 重建塔 → 计算 potentiality + stability。
+    每个 worker 自行管理环境生命周期 (进程级单例由 initializer 初始化)。
+    """
+    
+    active_ids = task["active_ids"]
+    active_ids = task["active_ids"]
+    num_layers = task["num_layers"]
+    seed = task["worker_seed"]
+
+    import gymnasium as gym
+    import torch
+    from mani_skill.utils.structs.pose import Pose
+    from jenga_tower import (
+        BLOCK_H, NUM_BLOCKS, get_support_graph,
+        get_gt_stability, get_gt_potentiality,
+    )
+
+    env = gym.make(
+        "JengaTower-v1", obs_mode="state", render_mode=None,
+        num_envs=1, sim_backend="cpu",
+    )
+    env.reset(seed=seed)
+    uw = env.unwrapped
+    device = uw.device
+    gap_w, gap_h = uw.gap_w, uw.gap_h
+    cx, cy = 0.2, 0.0
+
+    far = torch.tensor([[500.0, 500.0, 0.1]], device=device)
+    zero3 = torch.zeros(1, 3, device=device)
+
+    for idx in range(NUM_BLOCKS):
+        uw.blocks[idx].set_pose(Pose.create_from_pq(far))
+        uw.blocks[idx].set_linear_velocity(zero3)
+        uw.blocks[idx].set_angular_velocity(zero3)
+
+    for idx in active_ids:
+        level, i = divmod(idx, 3)
+        z = level * (BLOCK_H + gap_h) + BLOCK_H / 2
+        offset = (i - 1) * (0.05 + gap_w)
+        pos = [cx, cy + offset, z] if level % 2 == 0 else [cx + offset, cy, z]
+        uw.blocks[idx].set_pose(
+            Pose.create_from_pq(torch.tensor([pos], device=device))
+        )
+        uw.blocks[idx].set_linear_velocity(zero3)
+        uw.blocks[idx].set_angular_velocity(zero3)
+
+    for _ in range(60):
+        uw.scene.step()
+
+    active_blocks = [uw.blocks[i] for i in active_ids]
+
+    graph = get_support_graph(uw.scene, active_blocks)
+    poses_np = np.array([b.pose.p[0].cpu().numpy() for b in active_blocks])
+    s_load, s_balance = get_gt_stability(
+        graph["support_matrix"], graph["volumes"], poses_np
+    )
+    potentiality = get_gt_potentiality(uw.scene, active_blocks, sim_steps=100)
+
+    env.close()
+
+    return {
+        "env_i": task["env_i"],
+        "support_matrix": np.array(graph["support_matrix"], dtype=np.int8),
+        "volumes": np.array(graph["volumes"], dtype=np.float32),
+        "heights": np.array(graph["heights"], dtype=np.float32),
+        "poses": poses_np.astype(np.float32),
+        "s_load": s_load.astype(np.float32),
+        "s_balance": s_balance.astype(np.float32),
+        "potentiality": potentiality.astype(np.float32),
+    }
+
+
+# ─────────────────────────────────────────────────────
+#  HDF5 写入
+# ─────────────────────────────────────────────────────
 
 def flush_to_h5(h5path, buffer):
     if not buffer:
@@ -252,95 +400,9 @@ def flush_to_h5(h5path, buffer):
     buffer.clear()
 
 
-# ── CPU 环境: 用于精确采集 potentiality + 点云 ──
-
-class CPUCollector:
-    """单个 CPU 环境实例, 用于提取 potentiality 和点云。"""
-
-    def __init__(self):
-        self.env = gym.make(
-            "JengaTower-v1", obs_mode="state", render_mode="rgb_array",
-            num_envs=1, sim_backend="cpu",
-        )
-        self.env.reset(seed=99)
-        self.uw = self.env.unwrapped
-        self.device = self.uw.device
-        self.surround_cams = {
-            uid: s for uid, s in self.uw.scene.sensors.items()
-            if uid.startswith("surround")
-        }
-
-    def collect_sample(self, num_layers, active_ids, removed_ids, rng):
-        """
-        在 CPU 环境里精确重建塔 → 采集 stability / potentiality / 点云。
-        """
-        uw = self.uw
-        device = self.device
-        gap_w, gap_h = uw.gap_w, uw.gap_h
-        cx, cy = 0.2, 0.0
-
-        far = torch.tensor([[500.0, 500.0, 0.1]], device=device)
-        zero3 = torch.zeros(1, 3, device=device)
-
-        # reset 所有 block 到远处
-        for idx in range(NUM_BLOCKS):
-            uw.blocks[idx].set_pose(Pose.create_from_pq(far))
-            uw.blocks[idx].set_linear_velocity(zero3)
-            uw.blocks[idx].set_angular_velocity(zero3)
-
-        # 放置 active blocks
-        for idx in active_ids:
-            level, i = divmod(idx, 3)
-            z = level * (BLOCK_H + gap_h) + BLOCK_H / 2
-            offset = (i - 1) * (0.05 + gap_w)
-            pos = [cx, cy + offset, z] if level % 2 == 0 else [cx + offset, cy, z]
-            uw.blocks[idx].set_pose(
-                Pose.create_from_pq(torch.tensor([pos], device=device))
-            )
-            uw.blocks[idx].set_linear_velocity(zero3)
-            uw.blocks[idx].set_angular_velocity(zero3)
-
-        for _ in range(60):
-            uw.scene.step()
-
-        active_blocks = [uw.blocks[i] for i in active_ids]
-
-        # support graph (CPU 版, 用原始 get_contacts)
-        from jenga_tower import get_support_graph
-        graph = get_support_graph(uw.scene, active_blocks)
-
-        poses_np = np.array([b.pose.p[0].cpu().numpy() for b in active_blocks])
-        s_load, s_balance = get_gt_stability(
-            graph["support_matrix"], graph["volumes"], poses_np
-        )
-        potentiality = get_gt_potentiality(uw.scene, active_blocks, sim_steps=100)
-
-        pcd_data = render_point_cloud(uw.scene, self.surround_cams, active_blocks)
-        obs_pcd = np.zeros((len(active_blocks), N_PTS, 6), dtype=np.float32)
-        for bi, pc in enumerate(pcd_data["per_block_pcd"]):
-            if len(pc) == 0:
-                continue
-            if len(pc) > N_PTS:
-                obs_pcd[bi] = pc[rng.choice(len(pc), N_PTS, replace=False)]
-            else:
-                obs_pcd[bi, :len(pc)] = pc
-
-        return {
-            "support_matrix": np.array(graph["support_matrix"], dtype=np.int8),
-            "volumes": np.array(graph["volumes"], dtype=np.float32),
-            "heights": np.array(graph["heights"], dtype=np.float32),
-            "poses": poses_np.astype(np.float32),
-            "s_load": s_load.astype(np.float32),
-            "s_balance": s_balance.astype(np.float32),
-            "potentiality": potentiality.astype(np.float32),
-            "obs_point_clouds": obs_pcd,
-        }
-
-    def close(self):
-        self.env.close()
-
-
-# ── 主循环 ──
+# ─────────────────────────────────────────────────────
+#  主循环
+# ─────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
@@ -357,14 +419,11 @@ def main():
     uw = env.unwrapped
     device = uw.device
 
-    # CPU 采集器 (精确 potentiality + 点云)
-    cpu_collector = CPUCollector()
-
     counts = {b: 0 for b in BUCKET_CFG}
     skipped = 0
     global_idx = 0
 
-    # ── 断点续传 ──
+    # 断点续传
     if os.path.exists(args.out):
         print(f"[*] 检测到已存在的数据集 {args.out}，正在读取历史进度...")
         with h5py.File(args.out, "r") as f:
@@ -384,16 +443,20 @@ def main():
     total_target = target * len(BUCKET_CFG)
 
     t_start = time.time()
-    print(f"GPU 并行生成: {B} 个环境 × {len(BUCKET_CFG)} 桶 × {target} = {total_target} 样本")
+    print(f"GPU 并行生成: {B} envs, {args.workers} CPU workers")
+    print(f"目标: {len(BUCKET_CFG)} 桶 × {target} = {total_target} 样本")
     print(f"输出: {args.out}\n")
 
     while sum(counts.values()) < total_target:
         # ===== 阶段 1: GPU 批量 reset + 过滤 =====
-
-        # 为每个环境分配一个未满的桶
         unfilled = [b for b in bucket_names if counts[b] < target]
         if not unfilled:
             break
+        
+        # 计算每个桶还需要多少样本
+        remains = np.array([target - counts[b] for b in unfilled])
+        # 计算权重：剩下的越多，生成的概率越大
+        probs = remains / remains.sum()
 
         env_buckets = rng.choice(unfilled, size=B)
         num_layers_arr = np.zeros(B, dtype=int)
@@ -404,47 +467,33 @@ def main():
             num_layers_arr[i] = rng.integers(cfg["layers"][0], cfg["layers"][1] + 1)
             p_drop_arr[i] = rng.uniform(cfg["drop"][0], cfg["drop"][1])
 
-        # 并行 reset
         active_masks = batch_reset_tower(uw, num_layers_arr, rng, p_drop_arr, device)
 
-        # 额外稳定步
         for _ in range(10):
             uw.scene.step()
 
-        # 并行 collapse 检查
         collapsed = batch_check_collapse(
             uw, active_masks, num_layers_arr, args.collapse_threshold, device
         )
-
-        # 并行构建 support graph + 计算 complexity
         graphs = batch_build_support_graph(uw, active_masks, device)
 
-        # 逐环境过滤: 未坍塌 + complexity 在桶范围内
+        # 过滤
         candidates = []
         for env_i in range(B):
-            if collapsed[env_i]:
+            if collapsed[env_i] or graphs[env_i] is None:
                 skipped += 1
                 continue
-            if graphs[env_i] is None:
-                skipped += 1
-                continue
-
             bucket = env_buckets[env_i]
             cfg = BUCKET_CFG[bucket]
             graph = graphs[env_i]
-
             complexity = calculate_topology_complexity(
                 int(num_layers_arr[env_i]), graph["support_matrix"]
             )
-
             if not (cfg["c_lo"] <= complexity < cfg["c_hi"]):
                 skipped += 1
                 continue
-
-            # 检查桶是否还需要样本
             if counts[bucket] >= target:
                 continue
-
             candidates.append({
                 "env_i": env_i,
                 "bucket": bucket,
@@ -458,16 +507,45 @@ def main():
                 ],
             })
 
-        # ===== 阶段 2: CPU 精确采集 =====
+        if not candidates:
+            continue
+
+        # ===== 阶段 1.5: GPU 并行点云渲染 =====
+        cand_env_ids = [c["env_i"] for c in candidates]
+        pcd_map = batch_render_point_cloud(uw, active_masks, cand_env_ids, rng)
+
+        # ===== 阶段 2: 多进程 CPU — potentiality + stability =====
+        tasks = []
+        for ci, cand in enumerate(candidates):
+            if counts[cand["bucket"]] >= target:
+                continue
+            tasks.append({
+                "env_i": cand["env_i"],
+                "active_ids": cand["active_ids"],
+                "num_layers": cand["num_layers"],
+                "worker_seed": int(rng.integers(0, 2**31)),
+            })
+
+        if not tasks:
+            continue
+
+        # 多进程并行计算 potentiality + stability
+        worker_results = {}
+        with ProcessPoolExecutor(max_workers=min(args.workers, len(tasks))) as pool:
+            for res in pool.map(_worker_collect, tasks):
+                worker_results[res["env_i"]] = res
+
+        # 组装最终样本
         for cand in candidates:
             bucket = cand["bucket"]
             if counts[bucket] >= target:
                 continue
+            env_i = cand["env_i"]
+            if env_i not in worker_results:
+                continue
 
-            detail = cpu_collector.collect_sample(
-                cand["num_layers"], cand["active_ids"],
-                cand["removed_ids"], rng,
-            )
+            detail = worker_results[env_i]
+            obs_pcd = pcd_map.get(env_i, np.zeros((0, N_PTS, 6), dtype=np.float32))
 
             sample = {
                 "global_idx": global_idx,
@@ -478,7 +556,14 @@ def main():
                 "active_ids": np.array(cand["active_ids"], dtype=np.int32),
                 "removed_ids": np.array(cand["removed_ids"], dtype=np.int32)
                     if cand["removed_ids"] else np.zeros(0, dtype=np.int32),
-                **detail,
+                "support_matrix": detail["support_matrix"],
+                "volumes": detail["volumes"],
+                "heights": detail["heights"],
+                "poses": detail["poses"],
+                "s_load": detail["s_load"],
+                "s_balance": detail["s_balance"],
+                "potentiality": detail["potentiality"],
+                "obs_point_clouds": obs_pcd,
             }
             write_buf.append(sample)
             counts[bucket] += 1
@@ -502,7 +587,6 @@ def main():
             if sum(counts.values()) >= total_target:
                 break
 
-    # 最终 flush
     flush_to_h5(args.out, write_buf)
 
     elapsed = time.time() - t_start
@@ -514,9 +598,9 @@ def main():
     print(f"  耗时: {elapsed:.1f}s ({elapsed/max(global_idx,1):.2f}s/sample)")
     print(f"{'='*55}")
 
-    cpu_collector.close()
     env.close()
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True) # 强制使用 spawn
     main()

@@ -24,7 +24,7 @@ from mani_skill.utils.structs.types import SceneConfig, SimConfig
 BLOCK_L = 0.15   # 长 7.5 cm
 BLOCK_W = 0.05   # 宽 2.5 cm
 BLOCK_H = 0.03   # 高 1.5 cm
-NUM_LEVELS = 9
+NUM_LEVELS = 18
 NUM_BLOCKS = NUM_LEVELS * 3
 
 # 每层 3 块木块的颜色 (浅木 / 中木 / 深木)

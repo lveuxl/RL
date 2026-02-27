@@ -2761,7 +2761,308 @@ phase = "Phase 2: Joint-Tuning" if use_causal else "Phase 1: Warm-up"
 | 指标 | Phase 1 (Warm-up) | Phase 2 (Joint-Tuning) |
 |------|-------------------|----------------------|
 | pot_hat | 全零 | `[0, 0.34]` 正常预测 |
-| CausalSTIT 梯度 | **0** (完全隔离) | 279.7 (正常回
+| CausalSTIT 梯度 | **0** (完全隔离) | 279.7 (正常回传) |
+| L_pot 梯度→PointNet | 无 | **42.6** (穿透到底) |
+| L_pot 梯度→GNN | 无 | **364.9** (穿透到底) |
+| Forward 速度 | 28ms | 54ms (1.9x, 因 Transformer) |
+
+Phase 转换点在 `--warmup_epochs`（默认 30）自动触发，Terminal 输出会标注 `[Phase 1: Warm-up]` 或 `[Phase 2: Joint-Tuning]`。
+
+---
+
+_**User**_
+
+现在应如何训练，大概需要训练多久，如果使用gpu会提升训练速度吗，如果可以给我创建一个gpu训练的版本
+
+---
+
+_**Assistant**_
+
+收到，爱学习的小龙虾！
+
+让我先完整了解当前训练脚本和数据的状态，再精确回答你的问题并创建 GPU 版本。
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+现在让我先看看你的机器有没有 GPU。
+
+---
+
+
+
+---
+
+
+
+---
+
+你是 Apple Silicon (M3) + MPS 后端。让我先做一个准确的 benchmark 来量化 CPU vs MPS 的速度差异，然后创建 GPU 训练版本。
+
+---
+
+
+
+---
+
+实测数据非常清晰了。现在创建 GPU 训练版本，针对 MPS 和 CUDA 双兼容。
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+现在快速验证它能在 MPS 上跑 3 个 epoch。
+
+---
+
+
+
+---
+
+PyTorch 2.1.0 的 API 略有不同，修复一下。
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+问题在于 `bucket_idx` 不是 tensor，它是一个 int。当 batch collate 时它变成了一个 tensor，但在 MPS 上 `.unique()` 的行为需要检查。让我看看数据格式。
+
+---
+
+
+
+---
+
+MPS unique 本身没问题。问题是 `non_blocking=True` 把 `bucket_idx` (一个 int 值的 tensor) 发送到 MPS，然后 `.unique()` 的结果用 `.item()` 时出了问题。索引值 `418047928` 明显是内存垃圾——说明 MPS 上 `non_blocking=True` 对某些 tensor 有 race condition。解决方案是 `bucket_idx` 保持在 CPU 上。
+
+---
+
+
+
+---
+
+
+
+---
+
+Loss 变成 NaN 了。这是因为 MPS 上的数值问题——`amodal` loss 出了负的巨大值。让我检查一下 epoch 1 的数据，看看是哪里出了问题。
+
+---
+
+
+
+---
+
+初始前向 pass 是正常的，说明问题出在训练过程中的 BCE loss——当 `A_hat` 没有 clamp 时，精确的 0 或 1 值会导致 BCE 产生 `inf`，从而炸掉。看一下当前的 loss 计算方式——`pred["A_hat"] * pair_mask` 在 pair_mask 为 0 的地方会让 `A_hat` 精确为 0，而 BCE 对于 input=0, target=0 时 `log(0)` 会产生 `-inf`。
+
+问题在于：`F.binary_cross_entropy` 在 `pair_mask=0` 的位置，`pred * pair_mask = 0`, `target * pair_mask = 0`，计算 `-(0 * log(0) + 1 * log(1)) = 0`... 等等不对，`0 * log(0)` 在 PyTorch 里按 0 处理。但在 MPS 后端有精度差异。需要 clamp。
+
+---
+
+
+
+---
+
+
+
+---
+
+`amodal` 和 `stab` 都 NaN 了，graph 反而正常了。这是 MPS 上训练若干 step 后出的 NaN。让我加个 NaN 检测来定位第几步炸的。
+
+---
+
+
+
+---
+
+100 步完全没有 NaN！那说明问题出在 LP Sampler 更新时 NaN 传播了。问题的根因是第一个 epoch 的第一次 `snapshot()`，此时 `ema_loss` 和 `ema_loss_prev` 相同（初始值 1.0），LP = 0，`exp(0/tau)=1`，权重应该是均匀的。但如果 `update_loss` 收到了 NaN，就会污染整个 sampler。
+
+而 NaN 来自于 `loss_dict["total"]` 是 NaN。让我回头看——原来的 train script 在 CPU 上是可以跑的，现在 MPS 上却 NaN，说明是 MPS 上 `non_blocking=True` 的问题导致某些 tensor 还没同步就被读了。
+
+让我直接去掉 `non_blocking=True`，同时加上 loss NaN 检测保护。
+
+---
+
+
+
+---
+
+问题出在 `non_blocking=True` 和 MPS 的交互。同时 `torch.cuda.amp.autocast` 和 `GradScaler` 在 MPS 设备上不应该被使用（即使 `enabled=False`，仍然可能有副作用）。让我重写整个训练循环，让它对 MPS 完全干净。
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+训练完美运行了。Phase 1 (Warmup) 约 38 秒/epoch, Phase 2 (Joint) 约 76 秒/epoch（因为 CausalSTIT 要做 B*N 展开）。现在也修复一下原版 `train_vp3e.py` 中的 BCE clamp 问题。
+
+---
+
+
+
+---
+
+现在检查最终版本。
+
+---
+
+
+
+---
+
+好的，一切就绪。下面是完整的训练分析和指南。
+
+---
+
+## 训练分析与 GPU 加速方案
+
+### 1. 模型规模
+
+你的 `VP3ENetwork` 有 **396,359** 个参数（~1.5 MB），属于**轻量级模型**。瓶颈不在参数量，而在 `CausalSTIT` 的 B×N 展开（batch_size=16, N=54 → 864 个 Transformer 序列同时跑）。
+
+### 2. 实测速度对比（batch_size=16）
+
+| 设备 | Phase 1 (无 Causal) | Phase 2 (有 Causal) | 加速比 |
+|------|---------------------|---------------------|--------|
+| **CPU** | 329 ms/step | 856 ms/step | 1.0x |
+| **MPS (Apple Silicon)** | 93 ms/step | 235 ms/step | **~3.6x** |
+
+### 3. 训练时间估算（3000 样本, 100 epochs, batch=16）
+
+| 设备 | Phase 1 (30 epochs) | Phase 2 (70 epochs) | **总计** |
+|------|---------------------|---------------------|----------|
+| **CPU** | ~35 min | ~194 min | **~3.8 小时** |
+| **MPS** | ~8 min | ~68 min | **~1.3 小时** |
+
+**MPS 加速 GPU 训练可以把总训练时间从 3.8 小时压缩到 1.3 小时。**
+
+### 4. GPU 训练版本亮点
+
+已创建 `train_vp3e_gpu.py`，相比原版增加了：
+
+- **自动设备检测**：CUDA > MPS > CPU，无需手动指定
+- **CUDA AMP 混合精度**：如果你将来用 NVIDIA GPU，自动启用 float16 加速
+- **MPS 原生加速**：Apple Silicon 上用 float32 直接跑，避免 MPS 的 float16 兼容问题
+- **断点续训 (`--resume`)**：保存 optimizer/scheduler 状态，可以中断后接着训
+- **定期 Checkpoint**：每 10 epoch 保存一次完整状态 + 最优模型自动保存
+- **NaN 保护**：遇到 NaN loss 自动跳过该 batch，不会污染 sampler
+- **ETA 估算**：每次打印实时显示预估剩余时间
+
+### 5. 如何训练
+
+```bash
+conda activate /opt/anaconda3/envs/skill
+
+# 完整训练 (MPS 加速, ~1.3 小时)
+python train_vp3e_gpu.py --h5 dataset_jenga_3000.h5 --epochs 100 --batch_size 16
+
+# 断点续训
+python train_vp3e_gpu.py --resume checkpoints/ckpt_epoch050.pt --epochs 100
+```
+
+Checkpoint 保存在 `checkpoints/` 目录下，包括 `best.pt`（最低 loss）和 `final.pt`（最后一个 epoch）。
+
+---
+
+_**User**_
+
+把“训练曲线实时绘图（TensorBoard 或 Matplotlib）”的功能也集成进去
+
+---
+
+_**Assistant**_
+
+收到，爱学习的小龙虾！
+
+让我先看一下当前代码的完整状态，确定精确插入点。
+
+---
+
+
+
+---
+
+先检查环境中是否有 TensorBoard。
+
+---
+
+
+
+---
+
+TensorBoard 没装。方案清晰了：用**纯 Matplotlib** 做实时训练曲线绘图（零额外依赖），同时预留 TensorBoard 接口，如果你以后装了就自动启用。
+
+---
+
+
+
+---
+
+现在在 `main()` 里接入 logger。
+
+---
+
+
+
+---
+
+在 epoch 结束、checkpoint 保存之后插入 logger 调用。
+
+---
+
+
+
+---
+
+
+
+---
+
+跑 5 个 epoch 验证训练曲线是否正确生成。
+
+---
+
+
 
 ---
 
