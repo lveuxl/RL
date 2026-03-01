@@ -9,7 +9,7 @@ CPU:  float32 (fallback)
 
 Usage:
     conda activate /opt/anaconda3/envs/skill
-    python train_vp3e_gpu.py --h5 dataset_jenga_3000.h5 --epochs 100 --batch_size 16
+    python train_vp3e_gpu.py --h5 dataset_jenga_3000.h5 --epochs 100 --num_workers 4 --batch_size 16
     # 训练曲线保存在 checkpoints/curves.png, 每个 epoch 自动更新
     # 若已安装 tensorboard: tensorboard --logdir checkpoints/tb_logs
 """
@@ -64,7 +64,7 @@ class TrainingLogger:
                 self.tb.add_scalar(f"curriculum/w{i}", w, epoch)
             self.tb.flush()
 
-        self._plot(epoch)
+        #self._plot(epoch)
 
     def _plot(self, epoch: int):
         epochs = list(range(1, epoch + 1))
@@ -156,6 +156,10 @@ def parse_args():
     p.add_argument("--tau", type=float, default=0.1)
     p.add_argument("--eta", type=float, default=0.05)
     p.add_argument("--warmup_epochs", type=int, default=30)
+    # === 关键修改 1：增加 anneal_epochs 参数控制退火时长 ===
+    p.add_argument("--anneal_epochs", type=int, default=10, 
+                   help="Phase 2 软启动退火轮数(从0线性增加至w_pot设定值)")
+    # =======================================================
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--save_dir", type=str, default="checkpoints")
     p.add_argument("--save_every", type=int, default=10)
@@ -164,7 +168,8 @@ def parse_args():
     return p.parse_args()
 
 
-def compute_loss(pred, batch, args, use_causal: bool):
+# === 关键修改 2：接收动态的 current_w_pot 而不是单纯的 use_causal 布尔值 ===
+def compute_loss(pred, batch, args, current_w_pot: float):
     mask = batch["mask"].float()
     n_valid = mask.sum().clamp(min=1)
     pair_mask = mask.unsqueeze(2) * mask.unsqueeze(1)
@@ -173,19 +178,25 @@ def compute_loss(pred, batch, args, use_causal: bool):
     L_amodal = ((pred["bbox"] - batch["gt_bbox"]) ** 2 * mask.unsqueeze(-1)).sum() / n_valid
 
     a_pred = (pred["A_hat"] * pair_mask).clamp(1e-7, 1 - 1e-7)
-    L_graph = F.binary_cross_entropy(
-        a_pred, batch["support_matrix"] * pair_mask, reduction="sum",
-    ) / n_pairs
+    # 局部关闭混合精度，强制使用 float32 进行 BCE 计算，确保数值绝对安全
+    with torch.cuda.amp.autocast(enabled=False):
+        L_graph = F.binary_cross_entropy(
+            a_pred.float(), 
+            (batch["support_matrix"] * pair_mask).float(), 
+            reduction="sum",
+        ) / n_pairs
 
     L_stab = ((pred["stab_hat"] - batch["gt_stability"]) ** 2 * mask).sum() / n_valid
 
     total = args.w_amodal * L_amodal + args.w_graph * L_graph + args.w_stab * L_stab
 
-    if use_causal:
+    # === 根据当前的动态权重计算因果 Loss ===
+    if current_w_pot > 0:
         L_pot = ((pred["pot_hat"] - batch["gt_potentiality"]) ** 2 * mask).sum() / n_valid
-        total = total + args.w_pot * L_pot
+        total = total + current_w_pot * L_pot
     else:
         L_pot = torch.tensor(0.0, device=mask.device)
+    # ====================================
 
     return total, {
         "amodal": L_amodal.item(), "graph": L_graph.item(),
@@ -232,7 +243,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # AMP only on CUDA
-    use_amp = is_cuda
+    use_amp = False
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if is_cuda else None
 
     start_epoch = 1
@@ -259,12 +270,26 @@ def main():
           f"steps/epoch={steps_per_epoch}")
     print(f"Loss weights: amodal={args.w_amodal} graph={args.w_graph} "
           f"stab={args.w_stab} pot={args.w_pot}")
-    print(f"Progressive: warmup={args.warmup_epochs} → joint  "
+    print(f"Progressive: warmup={args.warmup_epochs} → anneal({args.anneal_epochs}) → joint  "
           f"(start_epoch={start_epoch})\n")
 
     for epoch in range(start_epoch, args.epochs + 1):
-        use_causal = epoch > args.warmup_epochs
-        phase = "Phase 2: Joint" if use_causal else "Phase 1: Warmup"
+        
+        # === 关键修改 3：增加线性退火逻辑计算 current_w_pot ===
+        if epoch <= args.warmup_epochs:
+            current_w_pot = 0.0
+            phase = "Phase 1: Warmup "
+            use_causal = False
+        elif epoch <= args.warmup_epochs + args.anneal_epochs:
+            progress = (epoch - args.warmup_epochs) / args.anneal_epochs
+            current_w_pot = args.w_pot * progress
+            phase = "Phase 2: Anneal "
+            use_causal = True
+        else:
+            current_w_pot = args.w_pot
+            phase = "Phase 2: Joint  "
+            use_causal = True
+        # ========================================================
 
         model.train()
         epoch_losses = {"amodal": 0., "graph": 0., "stab": 0., "pot": 0., "total": 0.}
@@ -280,8 +305,8 @@ def main():
                 with torch.cuda.amp.autocast():
                     pred = model(batch["obs_point_clouds"], batch["mask"],
                                  use_causal=use_causal)
-                    loss, loss_dict = compute_loss(pred, batch, args,
-                                                   use_causal=use_causal)
+                    # === 关键修改 4：传入当前的动态权重 ===
+                    loss, loss_dict = compute_loss(pred, batch, args, current_w_pot=current_w_pot)
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -291,8 +316,8 @@ def main():
             else:
                 pred = model(batch["obs_point_clouds"], batch["mask"],
                              use_causal=use_causal)
-                loss, loss_dict = compute_loss(pred, batch, args,
-                                               use_causal=use_causal)
+                # === 关键修改 4：传入当前的动态权重 ===
+                loss, loss_dict = compute_loss(pred, batch, args, current_w_pot=current_w_pot)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -338,18 +363,21 @@ def main():
         cur_lr = scheduler.get_last_lr()[0]
         logger.log_epoch(epoch, avg, cur_lr, [w[i].item() for i in range(len(w))])
 
-        should_print = (epoch <= 3 or epoch % 5 == 0
+        should_print = (epoch <= 3 or epoch % 10 == 0
                         or epoch == args.epochs
                         or epoch == args.warmup_epochs + 1)
         if should_print:
+            logger._plot(epoch)
             eta_min = dt * (args.epochs - epoch) / 60
+            # === 关键修改 5：在打印日志中显示当前的权重 ===
             print(f"[{phase:15s}] E{epoch:3d}/{args.epochs}  "
                   f"loss={avg['total']:.4f}  "
                   f"am={avg['amodal']:.4f} gr={avg['graph']:.4f} "
-                  f"st={avg['stab']:.4f} po={avg['pot']:.4f}  "
+                  f"st={avg['stab']:.4f} po={avg['pot']:.4f}(w={current_w_pot:.2f})  "
                   f"lr={cur_lr:.1e}  "
                   f"w=[{w[0]:.2f},{w[1]:.2f},{w[2]:.2f}]  "
                   f"{dt:.1f}s  ETA≈{eta_min:.0f}min")
+            # =============================================
 
     torch.save(model.state_dict(), os.path.join(args.save_dir, "final.pt"))
     logger.close()

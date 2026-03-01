@@ -32,7 +32,7 @@ from mani_skill.utils.structs.pose import Pose
 N_PTS = 256
 
 BUCKET_CFG = {
-    "easy":   {"c_lo": 0.0, "c_hi": 0.3, "layers": (3, 7),  "drop": (0.00, 0.05)},
+    "easy":   {"c_lo": 0.0, "c_hi": 0.4, "layers": (3, 7),  "drop": (0.10, 0.25)},
     "medium": {"c_lo": 0.3, "c_hi": 0.7, "layers": (8, 13), "drop": (0.05, 0.15)},
     "hard":   {"c_lo": 0.7, "c_hi": 1.5, "layers": (14, 18), "drop": (0.10, 0.25)},
 }
@@ -40,10 +40,10 @@ BUCKET_CFG = {
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--per_bucket", type=int, default=1000)
-    p.add_argument("--out", type=str, default="dataset_jenga_3000.h5")
+    p.add_argument("--per_bucket", type=int, default=10000)
+    p.add_argument("--out", type=str, default="dataset_jenga_30000.h5")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--num_envs", type=int, default=1024)
+    p.add_argument("--num_envs", type=int, default=256)
     p.add_argument("--workers", type=int, default=16,
                    help="CPU worker 进程数 (potentiality 并行)")
     p.add_argument("--collapse_threshold", type=float, default=0.03)
@@ -456,16 +456,28 @@ def main():
         # 计算每个桶还需要多少样本
         remains = np.array([target - counts[b] for b in unfilled])
         # 计算权重：剩下的越多，生成的概率越大
-        probs = remains / remains.sum()
-
-        env_buckets = rng.choice(unfilled, size=B)
+        #probs = remains / remains.sum()
+        probs = (remains ** 2) / (remains ** 2).sum()
+        env_buckets = rng.choice(unfilled, size=B, p=probs)
         num_layers_arr = np.zeros(B, dtype=int)
         p_drop_arr = np.zeros(B, dtype=float)
 
         for i in range(B):
+            bucket = env_buckets[i]
             cfg = BUCKET_CFG[env_buckets[i]]
-            num_layers_arr[i] = rng.integers(cfg["layers"][0], cfg["layers"][1] + 1)
-            p_drop_arr[i] = rng.uniform(cfg["drop"][0], cfg["drop"][1])
+            # num_layers_arr[i] = rng.integers(cfg["layers"][0], cfg["layers"][1] + 1)
+            # p_drop_arr[i] = rng.uniform(cfg["drop"][0], cfg["drop"][1])
+            # --- 关键修改：强制缩小采样范围 ---
+            if bucket == "easy":
+                # 产生极简塔：层数少，掉落多，极大概率落入 0.0-0.4
+                num_layers_arr[i] = rng.integers(3, 7) # 甚至可以尝试 (3, 6)
+                p_drop_arr[i] = rng.uniform(0.10, 0.30) # 增加空洞，降低复杂度
+            elif bucket == "medium":
+                num_layers_arr[i] = rng.integers(8, 13)
+                p_drop_arr[i] = rng.uniform(0.05, 0.15)
+            else: # hard
+                num_layers_arr[i] = rng.integers(14, 18)
+                p_drop_arr[i] = rng.uniform(0.10, 0.25)
 
         active_masks = batch_reset_tower(uw, num_layers_arr, rng, p_drop_arr, device)
 
