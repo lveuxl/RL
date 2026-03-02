@@ -10,6 +10,18 @@ CPU:  float32 (fallback)
 Usage:
     conda activate /opt/anaconda3/envs/skill
     python train_vp3e_gpu.py --h5 dataset_jenga_3000.h5 --epochs 100 --num_workers 4 --batch_size 16
+    python train_vp3e_gpu.py --h5 dataset_jenga_30000.h5 --epochs 60 --num_workers 4 --batch_size 32 --lr 4e-4 --warmup_epochs 20 --anneal_epochs 10
+    python train_vp3e_gpu.py --h5 dataset_jenga_30000.h5 \
+    --epochs 100 \
+    --lr 5e-4 \
+    --feat_dim 256 \
+    --gnn_layers 4 \
+    --tau 0.05 \
+    --num_workers 4  \
+    --batch_size 32 \
+    --warmup_epochs 20 \
+    --anneal_epochs 10
+    python train_vp3e_gpu.py --h5 dataset_jenga_30000.h5 --epochs 50 --num_workers 4 --batch_size 16 --lr 3e-4 --warmup_epochs 15 --anneal_epochs 8
     # 训练曲线保存在 checkpoints/curves.png, 每个 epoch 自动更新
     # 若已安装 tensorboard: tensorboard --logdir checkpoints/tb_logs
 """
@@ -141,12 +153,12 @@ def get_device():
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--h5", type=str, default="dataset_jenga_3000.h5")
+    p.add_argument("--h5", type=str, default="dataset_jenga_30000.h5")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--feat_dim", type=int, default=128)
-    p.add_argument("--gnn_layers", type=int, default=3)
+    p.add_argument("--gnn_layers", type=int, default=4)
     p.add_argument("--device", type=str, default=None,
                    help="cuda / mps / cpu (默认自动检测)")
     p.add_argument("--w_amodal", type=float, default=1.0)

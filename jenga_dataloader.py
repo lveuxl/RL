@@ -36,7 +36,7 @@ class JengaDataset(Dataset):
         bucket_idx:       int                   — 0=easy, 1=medium, 2=hard
     """
 
-    BUCKET_BOUNDS = [0.33, 0.66]  # easy < 0.33, medium < 0.66, hard >= 0.66
+    BUCKET_BOUNDS = [0.4, 0.8]  # easy < 0.4, medium < 0.8, hard >= 0.8
 
     def __init__(self, h5_path: str, max_blocks: int = 54, pts_dim: int = 3):
         self.h5_path = h5_path
@@ -161,8 +161,9 @@ class LPCurriculumSampler(Sampler):
 
     def snapshot(self):
         """在每个 epoch 结束时调用, 保存当前 EMA 为 prev, 并重新计算采样权重。"""
-        self.ema_loss_prev = self.ema_loss.clone()
+        
         self._weights = self.get_sampling_weights()
+        self.ema_loss_prev = self.ema_loss.clone()
 
     def get_sampling_weights(self) -> torch.Tensor:
         """返回三个桶的采样概率向量 (归一化)。"""

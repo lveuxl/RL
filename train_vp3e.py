@@ -3,7 +3,8 @@ VP3E 离线训练 — 特权蒸馏 + LP 课程采样
 
 Usage:
     conda activate /opt/anaconda3/envs/skill
-    python train_vp3e.py --h5 dataset_jenga_3000.h5 --epochs 100 --batch_size 8
+    python train_vp3e.py --h5 dataset_jenga_30000.h5 --epochs 60 --batch_size 32 --lr 4e-4 --warmup_epochs 20
+    python train_vp3e.py --h5 dataset_jenga_30000.h5 --epochs 50 --batch_size 16 --lr 3e-4 --warmup_epochs 15
 """
 import argparse
 import time
@@ -19,7 +20,7 @@ from vp3e_modules import VP3ENetwork
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--h5", type=str, default="dataset_jenga_3000.h5")
+    p.add_argument("--h5", type=str, default="dataset_jenga_30000.h5")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=3e-4)

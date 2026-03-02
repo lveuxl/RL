@@ -1,12 +1,13 @@
 """
-V-P3E 模块
+V-P3E 模块 + PriorGuidedActorCritic
 
-    InstancePerception   — 点云 → 节点特征 + Amodal BBox
-    ImplicitTopology     — 节点特征 → 支撑概率矩阵
-    PhysicalMessagePassing — 物理图卷积 (载荷传播)
-    StabilityHead        — 即刻稳定性预测
-    CausalSTIT           — 反事实 Transformer → Potentiality
-    VP3ENetwork          — 端到端封装
+    InstancePerception       — 点云 → 节点特征 + Amodal BBox
+    ImplicitTopology         — 节点特征 → 支撑概率矩阵
+    PhysicalMessagePassing   — 物理图卷积 (载荷传播)
+    StabilityHead            — 即刻稳定性预测
+    CausalSTIT               — 反事实 Transformer → Potentiality
+    VP3ENetwork              — 端到端封装
+    PriorGuidedActorCritic   — PPO Actor-Critic (先验引导 + 安全屏蔽)
 """
 import torch
 import torch.nn as nn
@@ -314,3 +315,90 @@ class VP3ENetwork(nn.Module):
             "F0": F0, "bbox": bbox, "A_hat": A_hat,
             "Z": Z, "stab_hat": stab_hat, "pot_hat": pot_hat,
         }
+
+
+# ════════════════════════════════════════════════════
+#  PriorGuidedActorCritic (PPO)
+# ════════════════════════════════════════════════════
+
+class PriorGuidedActorCritic(nn.Module):
+    """
+    PPO Actor-Critic，融合 V-P3E 先验引导 + 安全屏蔽。
+
+    Actor:
+        z_features → MLP → logits_rl  [B, N]
+        残差融合: logits_final = logits_rl + α·p_stab + β·p_pot
+        安全屏蔽: p_stab < threshold → logits = -1e8
+        输出: Categorical(logits=logits_final)
+
+    Critic:
+        mean_pool(z_features, mask) → MLP → V(s)  [B, 1]
+
+    Input:
+        z_features:  [B, N, D]  — V-P3E 物理融合节点特征 (Z)
+        p_stab_pred: [B, N]     — 即刻稳定性分数
+        p_pot_pred:  [B, N]     — 潜能分数
+        mask:        [B, N]     — bool, True=有效节点
+    """
+
+    def __init__(self, feat_dim: int = 128, hidden: int = 128,
+                 alpha_init: float = 1.0, beta_init: float = 1.0,
+                 stab_threshold: float = 0.2):
+        super().__init__()
+        self.stab_threshold = stab_threshold
+
+        # Actor MLP: per-node logits
+        self.actor_mlp = nn.Sequential(
+            nn.Linear(feat_dim, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, 64), nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+        )
+        self.alpha = nn.Parameter(torch.tensor(alpha_init))
+        self.beta = nn.Parameter(torch.tensor(beta_init))
+
+        # Critic MLP: global state value
+        self.critic_mlp = nn.Sequential(
+            nn.Linear(feat_dim, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, 64), nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+        )
+
+    def _masked_mean_pool(self, z: torch.Tensor, mask: torch.Tensor):
+        """有效节点均值池化: [B, N, D] → [B, D]"""
+        w = mask.float().unsqueeze(-1)                       # [B, N, 1]
+        return (z * w).sum(dim=1) / w.sum(dim=1).clamp(min=1)
+
+    def forward(self, z_features: torch.Tensor, p_stab_pred: torch.Tensor,
+                p_pot_pred: torch.Tensor, mask: torch.Tensor):
+        """
+        Returns:
+            dist:  Categorical 分布 (动作 = 选哪个节点)
+            value: [B, 1] 状态价值
+        """
+        # ---- Actor ----
+        logits_rl = self.actor_mlp(z_features).squeeze(-1)   # [B, N]
+        logits_final = logits_rl + self.alpha * p_stab_pred + self.beta * p_pot_pred
+
+        # 安全屏蔽: 不稳定节点 + padding 节点
+        blocked = (p_stab_pred < self.stab_threshold) | ~mask
+        logits_final = logits_final.masked_fill(blocked, -1e8)
+
+        dist = torch.distributions.Categorical(logits=logits_final)
+
+        # ---- Critic ----
+        value = self.critic_mlp(self._masked_mean_pool(z_features, mask))
+
+        return dist, value
+
+    def get_action_and_value(self, z_features: torch.Tensor, p_stab_pred: torch.Tensor,
+                             p_pot_pred: torch.Tensor, mask: torch.Tensor,
+                             action: torch.Tensor = None):
+        """PPO rollout / update 接口。"""
+        dist, value = self(z_features, p_stab_pred, p_pot_pred, mask)
+        if action is None:
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), value
+
+    def get_value(self, z_features: torch.Tensor, mask: torch.Tensor):
+        """GAE bootstrap: 仅需 Critic。"""
+        return self.critic_mlp(self._masked_mean_pool(z_features, mask))
