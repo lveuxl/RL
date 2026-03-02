@@ -836,7 +836,524 @@ Key things I need to integrate:
 9. **GAE computation**: standard GAE for advantage estimation
 10. **Episode-end GT computation**: compute_distill_gt() for full potentiality vectors
 
-Now I'm thinking through the buffer design—it needs to capture per-block point clouds along with all the other transition data like actions, rewards, and value estimates for the PPO updates.</details></think>
+Now I'm thinking through the buffer design—it needs to capture per-block point clouds along with all the other transition data like actions, rewards, and value estimates for the PPO updates.
+
+For the curriculum learning piece, I need to figure out how to pass the target complexity parameter into the environment. The reset function doesn't currently accept it, so I'll either need to modify the reset signature or use the options dict to pass it through.
+
+Looking at how `batch_reset_tower` works in the dataset generation code, it controls difficulty by adjusting the number of layers and the probability of dropping blocks. I can map the target complexity value to these parameters—something like lower complexity values give fewer layers with minimal block removal, while higher values create denser, more challenging towers.
+
+The cleanest implementation would be to let the environment create the full tower during reset, then have the wrapper post-process it by removing top layers and randomly dropping blocks based on the target complexity, avoiding the need to modify the core environment initialization logic. Building the training loop structure...
+
+For each iteration, I'll run a rollout phase where I reset the environment with the current curriculum target, render point clouds to feed into V-P3E for feature extraction, then use the actor-critic to select actions and step the environment. After collecting trajectories, I compute the distillation ground truth, run GAE for advantage estimation, and perform PPO updates over multiple epochs with minibatches. Then I update the curriculum based on success rate and decay the exploration parameter before logging.
+
+Defining the rollout buffer class... I'm thinking through the rendering strategy for point clouds during training. Since rendering is computationally expensive, I should only do it when the tower state actually changes—at the episode start and after each block extraction. Then I can feed those point clouds into V-P3E to get the stability predictions and potential values before taking each action.
+
+For measuring success in the curriculum, I need to track how many blocks get extracted without causing a collapse, then use that success rate to gradually increase the tower complexity when performance exceeds 0.85.
+
+To implement this, I'll modify the wrapper's reset method to accept a target complexity parameter that maps to specific tower configurations, then rebuild the tower with those parameters after each reset. The training loop will monitor the success rate and adjust the complexity accordingly. Defining the difficulty mapping... Configuring the block removal logic...
+
+Now I'm setting up the training loop and thinking through how to get point cloud data from the environment. I need to extract per-block point clouds and reshape them into the format the model expects—a batch of blocks with their point samples. Looking at the dataset generation code, they use 256 points per block, so I'll need to handle that preprocessing step.
+
+Preparing the point cloud input...
+
+Now I'm thinking through the complete training loop structure. I need to make sure the GAE computation, rollout buffer management, curriculum updates, and lambda decay all work together properly. Let me trace through what happens in a single episode starting from environment reset.
+
+For each step, I'm rendering the point clouds from the environment, getting the vision network embeddings with no gradients since that's frozen, then using those embeddings to get actions and values from the actor-critic network.
+
+Now I'm completing the action selection by passing in the stability estimates and mask, then setting those estimates as prior scores for the environment's intrinsic reward calculation. After stepping the environment, I store the transition data including the point clouds, actions, rewards, and ground truth information in the replay buffer, updating the mask for the next iteration until the episode terminates.
+
+At the end of the episode, I'm computing the ground truth potentiality scores from the environment and mapping them back to the buffer entries—each step in the distill data corresponds to its matching buffer entry, so I can fill in the potentiality targets for training.
+
+The tricky part is that the buffer only stores entries for valid extraction steps, while the training loop expects one entry per step. For invalid steps where extraction didn't happen, I'll just set the potentiality to zeros since they're rare anyway given the safety mask prevents most invalid actions. I think the simpler approach is better—collect one full episode at a time, then compute GAE and run the PPO update. This works well with curriculum learning since I can control difficulty per episode. Now I need to modify JengaPPOWrapper to accept target_c in reset and add a method to configure difficulty based on the BUCKET_CFG mappings.
+
+Looking at how target_c translates to game parameters: lower c values mean fewer layers and higher drop rates (easier), while higher c values mean more layers and lower drop rates (harder). So I can interpolate linearly across the difficulty spectrum to set the appropriate layer count and drop probability for each curriculum stage. Checking the actual values this produces across the curriculum range, the mapping looks solid—easier tasks get fewer layers and more dropout, while harder ones build up complexity with sparser drops. For the lambda decay, I'm realizing the user's linear schedule applies to the intrinsic reward coefficient, which decreases over training as the policy becomes more reliable and needs less of that prior bonus signal.
+
+Now I need to decide how to handle the target_c parameter in the wrapper. The cleanest approach is to modify JengaPPOWrapper directly to accept target_c in its reset method, rather than layering on additional wrappers or handling it scattered through the training loop.
+
+I'll need to add a method to configure difficulty settings and update the reset signature to support the target_c keyword argument while maintaining backward compatibility. Let me also verify the Pose import is available since I'll be using it.
+
+Writing the wrapper modifications and training script... Still writing the GAE function...
+
+For the training loop, I need to decide on rollout length—Jenga episodes are pretty short, probably only 5-15 steps before the tower falls, so I should batch multiple episodes together to get enough data per update. I'm torn between respecting the user's request for T-step rollouts versus keeping the implementation simple. The episode-by-episode approach is cleaner and easier to understand for a framework, so I'll go with that—it's what many manipulation papers use anyway, and the user asked for a framework rather than production code.
+
+Now I'm setting up the main training loop: for each iteration, I reset the environment with the target configuration, collect one full episode while tracking observations and rewards, detect if the episode ends in collapse, compute the ground truth distillation data at episode completion, calculate advantages and returns using GAE, then run the PPO update.
+
+Implementing the PPO update phase with multiple epochs of minibatch sampling and vision-based policy updates, while also managing curriculum learning by adjusting the target complexity based on success rate, decaying the lambda parameter over training, and logging metrics.
+
+Now I'm thinking through how to define success in the Jenga environment—the episode ends with collapse if the tower becomes unstable, or succeeds if blocks are removed without collapse or the episode reaches max steps, so I'll track success as a binary signal where 1 means no collapse occurred and 0 means the tower fell.
+
+I'll use an exponential moving average to smooth the success metric, which converges in about 10 episodes and gives me a good sense of how the agent is performing at the current difficulty level.
+
+Now I'm writing a helper function to generate point cloud inputs from the scene by extracting data from the surround cameras and converting it into per-block point clouds...
+
+Still writing point cloud processing...
+
+Next I need to update the JengaPPOWrapper to integrate this new observation format. I need to make sure the `_removed` array properly tracks all unavailable blocks—both those removed for difficulty configuration and those extracted by the agent. Blocks removed for difficulty should be marked as removed from initialization so the agent can't select them, and the safety mask will enforce this constraint.
+
+When the wrapper saves a snapshot of `_removed` before each extraction, it correctly includes difficulty-removed blocks, so the distillation ground truth calculation will properly account for absent blocks.
+
+Writing the wrapper modifications... Configuring the difficulty parameters...
+
+Now I'm thinking about how to structure the full training loop and what components I need to set up.
+
+For the replay buffer, I'll keep it simple with lists that get converted to tensors during updates. Since episodes are relatively short, I should probably collect a few episodes before doing an update, though the user's framework seems to suggest updating after each episode with T timesteps.
+
+The trickier part is handling the ground truth potentiality data. After each episode, I get the full potentiality values from the distillation function, but I need to map those back to my rollout buffer entries. The issue is that invalid actions—when the agent selects a block that's already been removed—won't have corresponding distillation data. For those steps, I'll just fill in zeros for the ground truth potentiality.
+
+Actually, thinking about this more carefully: the safety mask should prevent the agent from selecting removed blocks in the first place, so theoretically all actions should be valid. If the agent somehow does select an invalid block, it gets penalized but there's no distillation data entry for that step. For the initial implementation, I'll assume the safety mask works correctly and all actions are valid.
+
+Now for the point cloud rendering—that's going to be computationally expensive. Each step requires rendering from all camera viewpoints, processing the per-block point clouds, which is already quite costly.
+
+The rendering and processing takes around 100ms per step, which is acceptable for a framework prototype though production would need optimization. On the device side, SAPIEN runs on CPU while V-P3E and PPO can leverage GPU acceleration, so I'll need to handle data movement between CPU and GPU during training. Let me start writing the main training loop structure.
+
+Writing training loop... For GAE bootstrapping, I need to handle both terminal states (tower collapse or all blocks extracted) where next_value is zero, and truncated episodes where I use the value function estimate at the final state. After collecting one episode, I'll compute the ground truth from distillation, run GAE, stack everything into tensors, then loop through K update epochs with shuffled minibatches—though with only 5-15 steps per episode, I might skip minibatching and treat the whole episode as a single batch instead.
+
+Looking back at the requirement, the user wants T-step rollouts that feed into the buffer, then update using that buffer in a standard PPO loop. T steps can span multiple episodes, resetting at boundaries. The challenge is that compute_distill_gt() needs to work across episode transitions, so I'll need to handle that carefully when the rollout spans multiple episodes.
+
+During the T-step collection, I'll store per-step data from the info dict (gt_stab, gt_graph) as they come in, but for gt_pot I'll initially use zeros. When an episode ends, I'll call compute_distill_gt() and retroactively fill in the gt_pot values for that episode's steps. To track which buffer indices belong to which episode, I'll maintain pointers for episode boundaries.
+
+Actually, the cleaner approach is to collect full episodes first, compute gt_pot at episode end, then concatenate everything together for the update.
+
+Building the collection loop... I'm realizing this is getting too complicated with the minibatching approach. Let me step back and simplify—I'll collect one full episode per iteration and treat it as a single batch, which keeps things cleaner for the framework. The user just needs a clear code structure anyway, so I should stop overthinking and write out the actual implementation with a proper `run_episode` function, a `compute_gae` function, and a main training loop that connects them together. I'll also need to update the `JengaPPOWrapper` to handle `target_c` in reset and then write the training script with the vision input rendering function.
+
+Writing the training script...</details></think>
+
+---
+
+现在我对全部模块的接口、数据流、GT 计算逻辑有完整的掌握。需要做两件事：
+
+1. 修改 `JengaPPOWrapper.reset()` 支持 `target_c` 参数
+2. 编写 `train_jenga_ppo.py` 主训练循环
+
+先修改 Wrapper 支持课程学习的难度配置。
+
+---
+
+
+
+---
+
+
+
+---
+
+Wrapper 修改完成。现在编写主训练循环。
+
+---
+
+
+
+---
+
+
+
+---
+
+现在删除 `collect_episode` 函数，因为它在最终版本中未被使用（逻辑已内联到主循环中）。
+
+---
+
+
+
+---
+
+
+
+---
+
+验证最终文件完整性。
+
+---
+
+
+
+---
+
+代码完整，无 lint 错误。下面做深度架构解析。
+
+---
+
+## 全系统架构总览
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                   train_jenga_ppo.py  主循环                      │
+│                                                                  │
+│  ┌─ 课程控制器 ──────────────────────────────────────────────┐   │
+│  │  target_c: 0.20 → 0.25 → ... → 1.00                     │   │
+│  │  触发条件: success_ema > 0.85 (滑动窗口100, EMA α=0.1)   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                          ↓ target_c                              │
+│  ┌─ Rollout ─────────────────────────────────────────────────┐   │
+│  │  while steps < 64:                                        │   │
+│  │    env.reset(target_c)  →  _configure_difficulty(c)       │   │
+│  │    for step in episode:                                   │   │
+│  │      render_vp3e_input() → pcd [1,N,K,3]                 │   │
+│  │      vision_net(pcd)     → Z, stab, pot     [no_grad]     │   │
+│  │      rl_net(Z,stab,pot)  → action, logp, V  [no_grad]    │   │
+│  │      env.step(action)    → reward, info{GT}               │   │
+│  │    compute_distill_gt()  → gt_pot [N] 回填                │   │
+│  │    compute_gae()         → advantages, returns            │   │
+│  └───────────────────────────────────────────── Buffer ──────┘   │
+│                          ↓                                       │
+│  ┌─ Update ──────────────────────────────────────────────────┐   │
+│  │  for epoch in range(4):                                   │   │
+│  │    for minibatch in shuffle(Buffer):                      │   │
+│  │      ppo_vision_update()                                  │   │
+│  │        ├→ loss_rl.backward()      → opt_rl.step()         │   │
+│  │        └→ loss_distill.backward() → opt_vision.step()     │   │
+│  │      if approx_kl > 0.05: break                           │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                          ↓                                       │
+│  ┌─ 调度 ────────────────────────────────────────────────────┐   │
+│  │  λ_t = λ_0 · (1 − global_step / total_steps)  蒸馏衰减   │   │
+│  │  if success_ema > 0.85: target_c += 0.05       课程升级   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 三个关键时间尺度的调度
+
+| 调度机制 | 时间尺度 | 公式/逻辑 | 物理含义 |
+|---|---|---|---|
+| **蒸馏衰减** λ_t | 每个 iteration | `λ₀ · (1 - t/T)` | 训练初期依赖 V-P3E 先验引导，后期 RL 策略独立决策 |
+| **课程升级** target_c | Episode 级 | `success_ema > 0.85 → c += 0.05` | 当前难度掌握后才挑战更高复杂度 |
+| **KL 早停** | Minibatch 级 | `approx_kl > 0.05 → break` | 防止策略更新过大导致崩溃 |
+
+### 课程学习的难度映射
+
+```python
+# _configure_difficulty(target_c)
+num_layers = int(3 + target_c * 15)    # c=0.2 → 6层, c=1.0 → 18层
+p_drop = 0.2 * (1 - target_c * 0.8)   # c=0.2 → 17%空洞, c=1.0 → 4%空洞
+```
+
+| target_c | 层数 | 空洞率 | 积木总数 | 难度描述 |
+|---|---|---|---|---|
+| 0.20 | 6 | 17% | ~15 | 矮塔+多空洞，极易 |
+| 0.50 | 10 | 12% | ~27 | 中等高度 |
+| 0.85 | 16 | 6% | ~45 | 接近完整塔 |
+| 1.00 | 18 | 4% | ~52 | 完整 Jenga 塔 |
+
+### GT 数据流: 每步 vs Episode 末
+
+```
+每步 (info 字典):
+  gt_support_matrix [N,N]  ← get_support_graph()    ~5ms
+  gt_stability      [N]    ← get_gt_stability()     ~2ms
+  gt_potentiality_i scalar  ← 实际抽取免费获得        ~0ms
+
+Episode 结束后 (compute_distill_gt):
+  gt_potentiality   [N]    ← 批量反事实模拟          ~N×80步/step
+  用于 V-P3E 蒸馏 loss 的完整监督信号
+```
+
+### 修改/新建的文件
+
+| 文件 | 操作 | 内容 |
+|---|---|---|
+| `jenga_ppo_wrapper.py` | **修改** | `reset()` 增加 `target_c` 参数 + `_configure_difficulty()` 方法 |
+| `train_jenga_ppo.py` | **新建** | 主训练循环（~390 行）|
+
+---
+
+_**User**_
+
+在我的电脑cpu、服务器4090、服务器H100上分别需要如何设置训练参数，分别需要训练多久，total_steps需要多少，超参数如何设置
+
+---
+
+_**Assistant**_
+
+收到，爱学习的小龙虾！
+
+让我先确认你环境的具体规模和计算瓶颈，然后给出精准的参数配置。
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+注意到你的 `NUM_LEVELS = 9`（当前为 9 层 27 块），这比之前对话中的 18 层有所调整。让我精确计算各环节的时间成本。
+
+---
+
+
+
+---
+
+现在让我精确分析计算瓶颈。核心问题在于：这个训练循环是 **CPU-bound**，不是 GPU-bound。
+
+---
+
+## 深度分析：时间瓶颈在哪里
+
+先拆解每一步的耗时构成：
+
+| 操作 | 计算位置 | 每步耗时（估算） | 说明 |
+|---|---|---|---|
+| `render_point_cloud()` | CPU (SAPIEN) | ~50-100ms | 4 个相机渲染 256×256 |
+| `vision_net(pcd)` | GPU/CPU | ~5-20ms | VP3E + CausalSTIT |
+| `rl_net(Z,stab,pot)` | GPU/CPU | ~1ms | 小 MLP |
+| `env.step(action)` | CPU (SAPIEN) | **~300-500ms** | 80 步 physics settle |
+| `_quick_gt()` | CPU | ~5ms | 接触力提取 |
+| `compute_distill_gt()` | CPU (SAPIEN) | **~N×80步/step** | Episode 末批量回溯 |
+| `ppo_vision_update()` | GPU | ~10-50ms | 前向+双路backward |
+
+**核心瓶颈：`env.step()` 中的 80 步物理稳定（settle_steps）和 episode 末的 gt_potentiality 回溯**。这两项是 SAPIEN 物理引擎的串行 CPU 模拟，GPU 再强也无法加速。
+
+当前配置 N=27（9层），每步 settle=80：
+- `env.step()` = 80 × ~2ms/step = **~160ms**
+- `compute_distill_gt()` per episode (假设 5 步 episode, 27 active blocks) = 5 × 27 × 80 × 2ms = **~21.6s**
+
+这意味着每个 episode 的 rollout 约 5×0.4s = 2s，但 **GT 回溯占 21.6s**。GT 回溯是最大瓶颈。
+
+---
+
+## 三种硬件的配置方案
+
+### 配置 1：你的 Mac CPU（MPS 或纯 CPU）
+
+```bash
+# Mac 本地 — 调试 & 验证用，不追求收敛
+python train_jenga_ppo.py \
+    --vp3e_ckpt checkpoints/best.pt \
+    --device mps \
+    --total_steps 5000 \
+    --rollout_steps 16 \
+    --max_ep_steps 8 \
+    --minibatch_size 8 \
+    --update_epochs 3 \
+    --feat_dim 128 \
+    --n_pts 128 \
+    --lr_rl 3e-4 \
+    --lr_vision 5e-5 \
+    --gamma 0.99 \
+    --gae_lambda 0.95 \
+    --clip_coef 0.2 \
+    --ent_coef 0.02 \
+    --target_kl 0.05 \
+    --init_complexity 0.2 \
+    --lambda_init 0.15 \
+    --save_every 20 \
+    --seed 42
+```
+
+| 参数 | 值 | 理由 |
+|---|---|---|
+| total_steps | **5,000** | 仅验证 pipeline 跑通，不追求收敛 |
+| rollout_steps | **16** | 减少每轮 GT 回溯量（~2-3 个 episode） |
+| max_ep_steps | **8** | 缩短 episode，减少 GT 回溯的 N×steps |
+| minibatch_size | **8** | 内存友好 |
+| n_pts | **128** | 减半点云降低 VP3E 前向开销 |
+| ent_coef | **0.02** | 小 rollout 需要更多探索 |
+
+**预计速度**：~0.5-1 step/s（含 GT 回溯），总时长 **~1.5-3 小时**
+
+---
+
+### 配置 2：服务器 RTX 4090（24GB VRAM）
+
+```bash
+# 4090 服务器 — 正式训练
+python train_jenga_ppo.py \
+    --vp3e_ckpt checkpoints/best.pt \
+    --device cuda \
+    --total_steps 100000 \
+    --rollout_steps 64 \
+    --max_ep_steps 15 \
+    --minibatch_size 32 \
+    --update_epochs 4 \
+    --feat_dim 128 \
+    --gnn_layers 3 \
+    --n_pts 256 \
+    --lr_rl 3e-4 \
+    --lr_vision 1e-4 \
+    --gamma 0.99 \
+    --gae_lambda 0.95 \
+    --clip_coef 0.2 \
+    --vf_coef 0.5 \
+    --ent_coef 0.01 \
+    --max_grad_norm 0.5 \
+    --target_kl 0.05 \
+    --init_complexity 0.2 \
+    --complexity_step 0.05 \
+    --success_threshold 0.85 \
+    --lambda_init 0.1 \
+    --w_stab 1.0 \
+    --w_pot 1.0 \
+    --w_graph 1.0 \
+    --save_every 50 \
+    --seed 42
+```
+
+| 参数 | 值 | 理由 |
+|---|---|---|
+| total_steps | **100,000** | 课程从 c=0.2→1.0 需 17 次升级，每级 ~5K 步收敛 |
+| rollout_steps | **64** | ~5-8 个 episode/rollout，足够的样本多样性 |
+| max_ep_steps | **15** | 9 层塔最多移 ~20 块，15 步合理 |
+| minibatch_size | **32** | 4090 VRAM 绰裕，[32, 27, 256, 3] ≈ 25MB |
+| lr_rl / lr_vision | **3e-4 / 1e-4** | RL 快学、Vision 慢调，经典双速率 |
+| ent_coef | **0.01** | 标准值，64 步 rollout 有足够探索 |
+
+**预计速度**：~2-3 step/s（瓶颈仍在 SAPIEN CPU 物理），**~10-14 小时** 完成全部训练
+
+**关键洞察**：4090 的 GPU 算力在这个任务上是过剩的。network forward + backward 只占每步总时间的 ~10%。瓶颈是 SAPIEN 物理引擎的串行 CPU 模拟。所以 4090 和 H100 的差距远没有你想象的大。
+
+---
+
+### 配置 3：服务器 H100（80GB VRAM）
+
+```bash
+# H100 服务器 — 激进参数，利用强 CPU 多线程
+python train_jenga_ppo.py \
+    --vp3e_ckpt checkpoints/best.pt \
+    --device cuda \
+    --total_steps 200000 \
+    --rollout_steps 128 \
+    --max_ep_steps 20 \
+    --minibatch_size 64 \
+    --update_epochs 6 \
+    --feat_dim 128 \
+    --gnn_layers 4 \
+    --n_pts 256 \
+    --lr_rl 2e-4 \
+    --lr_vision 5e-5 \
+    --gamma 0.995 \
+    --gae_lambda 0.97 \
+    --clip_coef 0.15 \
+    --vf_coef 0.5 \
+    --ent_coef 0.005 \
+    --max_grad_norm 0.5 \
+    --target_kl 0.03 \
+    --init_complexity 0.2 \
+    --complexity_step 0.03 \
+    --success_threshold 0.85 \
+    --ema_decay 0.95 \
+    --lambda_init 0.1 \
+    --w_stab 1.0 \
+    --w_pot 1.5 \
+    --w_graph 0.5 \
+    --save_every 100 \
+    --seed 42
+```
+
+| 参数 | 值 | 理由 |
+|---|---|---|
+| total_steps | **200,000** | 更细粒度课程（step=0.03），更充分训练 |
+| rollout_steps | **128** | ~8-15 个 episode/rollout，降低 variance |
+| minibatch_size | **64** | H100 VRAM 80GB，完全不是瓶颈 |
+| update_epochs | **6** | 更大 rollout 支撑更多 epoch 重用 |
+| gnn_layers | **4** | 更深 GNN，H100 forward 开销忽略不计 |
+| gamma / gae_lambda | **0.995 / 0.97** | 更长期的信用分配，因为 H100 上训练步数更多 |
+| clip_coef | **0.15** | 更保守的策略更新，长训练更稳定 |
+| target_kl | **0.03** | 更严的 KL 约束，防止后期策略崩溃 |
+| ent_coef | **0.005** | 大 rollout 自然有足够探索，降低熵奖励 |
+| complexity_step | **0.03** | 更细粒度的课程升级（34 级而非 17 级） |
+| ema_decay | **0.95** | 更平滑的成功率估计 |
+| w_pot / w_graph | **1.5 / 0.5** | 偏重 potentiality 蒸馏，轻 graph（后者离线已学好） |
+| lr_rl / lr_vision | **2e-4 / 5e-5** | 更保守，配合长训练避免震荡 |
+
+**预计速度**：~2-4 step/s（CPU 瓶颈与 4090 相同），**~14-28 小时**
+
+---
+
+## 对比总表
+
+| | Mac CPU/MPS | 4090 服务器 | H100 服务器 |
+|---|---|---|---|
+| **定位** | 调试验证 | 正式训练 | 深度训练 |
+| total_steps | 5K | 100K | 200K |
+| rollout_steps | 16 | 64 | 128 |
+| minibatch_size | 8 | 32 | 64 |
+| update_epochs | 3 | 4 | 6 |
+| n_pts | 128 | 256 | 256 |
+| lr_rl | 3e-4 | 3e-4 | 2e-4 |
+| lr_vision | 5e-5 | 1e-4 | 5e-5 |
+| gamma | 0.99 | 0.99 | 0.995 |
+| clip_coef | 0.2 | 0.2 | 0.15 |
+| ent_coef | 0.02 | 0.01 | 0.005 |
+| target_kl | 0.05 | 0.05 | 0.03 |
+| complexity_step | 0.05 | 0.05 | 0.03 |
+| 每步速度 | ~0.5-1 sps | ~2-3 sps | ~2-4 sps |
+| **总时长** | **~1.5-3h** | **~10-14h** | **~14-28h** |
+| 课程级数 | ~3 级 (到 c≈0.35) | ~17 级 (到 c=1.0) | ~27 级 (到 c=1.0) |
+
+---
+
+## 为什么 4090 和 H100 速度差不多
+
+这是最关键的一个洞察。来看每步的时间分解：
+
+```
+单步时间 ≈ 400ms
+  ├─ render_point_cloud()   80ms   (CPU, SAPIEN 渲染)
+  ├─ vision_net.forward()   15ms   (GPU)    ← 4090 vs H100 差异在这里
+  ├─ env.step()            280ms   (CPU, 80步物理模拟)  ← 瓶颈！
+  └─ misc                   25ms   (CPU)
+```
+
+GPU 只占 ~4% 的总时间。4090 和 H100 的 GPU 算力差 3 倍，但只影响这 4%，所以端到端加速 < 3%。
+
+**真正的加速手段**：
+1. **减少 settle_steps**（80→50）：直接减 37% 的 env.step 时间，但会降低物理精度
+2. **跳过 compute_distill_gt**（最耗时）：可以改为每 N 个 episode 才算一次，或者只在课程升级后算
+3. **多环境并行**：ManiSkill 支持 GPU 物理后端并行多环境，但 JengaPPOWrapper 目前只支持单环境
+
+这些优化手段不论哪种 GPU 都同样有效。GPU 选择的主要价值体现在 `ppo_vision_update` 中 CausalSTIT Transformer 的 backward（N=27 展开为 B×27 个序列），minibatch_size=64 时 H100 比 4090 快约 2 倍在这一步上。
+
+---
+
+_**User**_
+
+能修改实现ManiSkill GPU 物理后端并行多环境吗
+
+---
+
+_**Assistant**_
+
+<think><details><summary>Thought Process</summary>The user wants to modify the training pipeline to support ManiSkill's GPU physics backend with parallel multi-environment execution. This is a significant architectural change that would speed up training by parallelizing SAPIEN physics simulation across multiple environments on the GPU.
+
+Let me think about what needs to change:
+
+1. **Environment creation**: `sim_backend="gpu"` instead of `"cpu"`, `num_envs=N` instead of `1`
+2. **JengaPPOWrapper**: needs to handle batched environments (B>1)
+3. **Point cloud rendering**: needs to handle batched rendering
+4. **GT computation**: the most complex part - batched support graph, stability, potentiality
+
+
+5. **Backend limitations**: The GPU physics backend doesn't support per-scene contact queries or state manipulation that the current ground truth computation relies on, so I'll need to either compute these on CPU or find GPU-compatible alternatives.
+
+6. **Existing patterns**: Looking at how `generate_dataset_gpu.py` handles this, they use batched contact force queries and parallel point cloud rendering, which suggests I should follow a similar approach for the training loop.
+
+7. **The real bottleneck**: The `compute_distill_gt()` method's counterfactual simulation—where we need to reset and replay scenes to compute ground truth—is fundamentally sequential and may not parallelize well with GPU physics, so I need to figure out if this can be restructured or if it needs to stay on CPU. the architecture changes needed:
+
+1. **Env creation**: GPU backend with num_envs=N
+2. **Wrapper**: Fully batched - `_removed` becomes [B, N], mask becomes [B, N], etc.
+3. **Support graph**: Use `get_pairwise_contact_forces()` from generate_dataset_gpu.py
+4. **GT stability**: Can be computed analytically (no SAPIEN dependency)
+5. **GT potentiality**: This is the hard part. Options:
+   a. Skip it during rollout, only compute for distillation offline
+   b. Compute it only for the selected block (using per-env state save/restore)
+   c. Use CPU workers in parallel (like generate_dataset_gpu.py)
+
+The core constraint is that the GPU physics backend can't save/restore individual environment states—it's all-or-nothing for the entire batch. So I can't run counterfactual simulations per environment without disrupting the others. The most practical solution is to decouple GT potentiality computation entirely from the training loop, relying instead on pre-trained V-P3E predictions as pseudo-labels, while computing stability and support matrices directly from contact forces. Alternatively, I could spawn separate CPU workers asynchronously for GT computation, similar to how the dataset generation pipeline works. GPU parallel for rollout (fast environment stepping, no settle_steps since all envs step together)
+2. Use `get_pairwise_contact_forces()` for batched support graph
+3. Use analytical stability computation (no SAPIEN dependency)
+4. For potentiality: either skip during online training or use a separate CPU thread pool
+
+The key insight is that with GPU-parallel environments, I can remove blocks across all B environments simultaneously and then run the settling simulation (80 steps) once for the entire batch—this is where the real speedup comes from. Instead of 80 × 512 individual steps, it's just 80 calls to `scene.step()` with all environments advancing together.
+
+So the architecture becomes: a batched wrapper where `step(actions)` takes a [B] tensor of actions, removes the selected block in each environment, runs settling in parallel across all environments, checks displacement for all of them at once, and computes rewards in batch. For the support graph I'll use batched contact forces, and stability can be computed analytically without SAPIEN. Potentiality is tricky though—I'll skip it during online training since even with GPU acceleration, the counterfactual nature of checking each block removal individually makes it too expensive.</details></think>
 
 ---
 

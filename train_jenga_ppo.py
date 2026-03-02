@@ -76,8 +76,8 @@ def parse_args():
     p = argparse.ArgumentParser()
     # 模型
     p.add_argument("--vp3e_ckpt", type=str, default="checkpoints/best.pt")
-    p.add_argument("--feat_dim", type=int, default=128)
-    p.add_argument("--gnn_layers", type=int, default=3)
+    p.add_argument("--feat_dim", type=int, default=256)
+    p.add_argument("--gnn_layers", type=int, default=4)
     p.add_argument("--n_pts", type=int, default=256)
     # 训练
     p.add_argument("--total_steps", type=int, default=200_000)
