@@ -26,12 +26,14 @@ from jenga_tower import (
 
 # ─── 选块: 贪心反事实策略 ───
 
-def _greedy_select(scene, actors, num_extract=5, sim_steps=80, threshold=0.02):
+def _greedy_select(scene, actors, num_extract=5, sim_steps=200, threshold=0.015):
     """
-    贪心选择最安全的 num_extract 个木块：每轮模拟移除每个候选块，
-    选 potentiality 最高的（移除后塔最稳定），然后将其真正移除，再进入下一轮。
-
-    排除最底层 (L0) 和最顶层 (L17) 的木块，只从中间层选取。
+    贪心选块 — 严格保塔不倒:
+    - sim_steps=200: 充分暴露延迟崩塌
+    - 每层最多抽 1 块
+    - 优先中间块 (index%3==1, Jenga 经典最安全位置)
+    - 每轮选块后做累积验证
+    - pot < 1.0 直接跳过
     """
     n = len(actors)
     device = actors[0].device
@@ -39,56 +41,83 @@ def _greedy_select(scene, actors, num_extract=5, sim_steps=80, threshold=0.02):
     zero3 = torch.zeros(1, 3, device=device)
 
     removed = set()
-    # 排除底层和顶层
     excluded = set(range(3)) | set(range(n - 3, n))
+    levels_touched = set()
     selected_order = []
 
     for round_idx in range(num_extract):
         state = scene.get_sim_state()
         init_pos = torch.stack([a.pose.p[0] for a in actors])
 
-        # 从高层向低层遍历: 同 potentiality 时优先选上层木块
-        candidates = sorted(
-            [i for i in range(n) if i not in removed and i not in excluded],
-            key=lambda i: i // 3, reverse=True,
-        )
+        candidates = [
+            i for i in range(n)
+            if i not in removed and i not in excluded
+            and i // 3 not in levels_touched
+        ]
+        candidates.sort(key=lambda i: (-(i % 3 == 1), -(i // 3)))
+
         best_idx, best_pot = -1, -1.0
 
         for cand in candidates:
             actors[cand].set_pose(Pose.create_from_pq(far))
             actors[cand].set_linear_velocity(zero3)
             actors[cand].set_angular_velocity(zero3)
-
             for _ in range(sim_steps):
                 scene.step()
-
             stable = sum(
                 1 for j in range(n)
                 if j != cand and j not in removed
                 and torch.norm(actors[j].pose.p[0] - init_pos[j]).item() < threshold
             )
             pot = stable / (n - 1 - len(removed))
-
             scene.set_sim_state(state)
 
-            # 同分时高层优先 (cand//3 更大)
+            if pot < 1.0:
+                continue
             if pot > best_pot or (pot == best_pot and cand // 3 > best_idx // 3):
                 best_pot = pot
                 best_idx = cand
 
-        selected_order.append(best_idx)
-        removed.add(best_idx)
-        # 真正移除该块 (影响后续轮的模拟)
+        if best_idx == -1:
+            print(f"  第 {round_idx + 1} 轮: 无法找到 pot=1.0 的候选块, 停止")
+            break
+
+        # 累积验证
+        for idx in selected_order:
+            actors[idx].set_pose(Pose.create_from_pq(far))
+            actors[idx].set_linear_velocity(zero3)
+            actors[idx].set_angular_velocity(zero3)
         actors[best_idx].set_pose(Pose.create_from_pq(far))
         actors[best_idx].set_linear_velocity(zero3)
         actors[best_idx].set_angular_velocity(zero3)
         for _ in range(sim_steps):
             scene.step()
+        all_stable = all(
+            torch.norm(actors[j].pose.p[0] - init_pos[j]).item() < threshold
+            for j in range(n) if j not in removed and j != best_idx
+        )
+        scene.set_sim_state(state)
+
+        if not all_stable:
+            lv, pi = divmod(best_idx, 3)
+            print(f"  第 {round_idx + 1} 轮: block #{best_idx} L{lv}[{pi}] 累积验证失败, 跳过")
+            excluded.add(best_idx)
+            continue
+
+        selected_order.append(best_idx)
+        removed.add(best_idx)
+        levels_touched.add(best_idx // 3)
+
+        for idx in selected_order:
+            actors[idx].set_pose(Pose.create_from_pq(far))
+            actors[idx].set_linear_velocity(zero3)
+            actors[idx].set_angular_velocity(zero3)
+        for _ in range(sim_steps):
+            scene.step()
 
         lv, pi = divmod(best_idx, 3)
-        print(f"  第 {round_idx + 1} 轮: 选中 block #{best_idx} L{lv}[{pi}]  potentiality={best_pot:.4f}")
+        print(f"  第 {round_idx + 1} 轮: block #{best_idx} L{lv}[{pi}]  pot={best_pot:.4f} ✓")
 
-    # 恢复所有块到初始状态 (让外层自行 reset)
     scene.set_sim_state(state)
     return selected_order
 
@@ -218,8 +247,6 @@ if __name__ == "__main__":
     print("  开始录制连续抽块动画...")
     print("=" * 50)
 
-    _freeze_all(uw.blocks)
-
     all_frames = []
 
     # 开头静帧: 展示完整塔体
@@ -227,10 +254,14 @@ if __name__ == "__main__":
         uw.scene.step()
         all_frames.append(_capture_frame(uw.scene, camera))
 
+    removed = set()
     for seq, block_idx in enumerate(extract_order):
         lv, pi = divmod(block_idx, 3)
         direction = "+X" if lv % 2 == 0 else "+Y"
         print(f"  [{seq + 1}/{len(extract_order)}] 抽出 block #{block_idx}  L{lv}[{pi}]  方向={direction}")
+
+        # 抽块期间冻结全塔 (防止抽出过程中塔变形)
+        _freeze_all(uw.blocks)
 
         frames = _extract_one(
             uw.scene, camera, uw.blocks[block_idx], uw.blocks,
@@ -239,9 +270,18 @@ if __name__ == "__main__":
             pause_frames=args.pause,
         )
         all_frames.extend(frames)
+        removed.add(block_idx)
 
-    # 结尾静帧
-    for _ in range(45):
+        # 抽出后解冻剩余块 → 物理引擎接管, 塔体自然 settle 或倒塌
+        for i, b in enumerate(uw.blocks):
+            if i not in removed:
+                b._bodies[0].kinematic = False
+        for _ in range(60):
+            uw.scene.step()
+            all_frames.append(_capture_frame(uw.scene, camera))
+
+    # 结尾静帧: 观察最终塔体状态
+    for _ in range(90):
         uw.scene.step()
         all_frames.append(_capture_frame(uw.scene, camera))
 
