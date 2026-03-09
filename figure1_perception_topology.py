@@ -140,12 +140,11 @@ def generate_figure1():
         graph["support_matrix"], graph["volumes"], block_poses,
     )
 
-    ### 关键修改点 START ###
     # ── 3. Amodal Geometry (Perfect Instance Regression) ──
-    # 修改逻辑：不再混合带有缺陷和噪声的 real_pts，也不做 KDTree 查重。
-    # 既然方法是预测 Bounding Box 参数，直接在完美的三维框表面生成无噪声的致密点云。
     np.random.seed(0)
-    TARGET_DENSITY = 1200 # 稍微增加密度，让几何体看起来更致密、锐利
+    from scipy.spatial import cKDTree
+    TARGET_DENSITY = 1000
+    DEDUP_RADIUS = 0.002
 
     amodal_xyz_list, amodal_level_list = [], []
 
@@ -158,11 +157,34 @@ def generate_figure1():
             if level % 2 == 0
             else np.array([BLOCK_W / 2, BLOCK_L / 2, BLOCK_H / 2])
         )
+        real_pts = per_block[i][:, :3] if len(per_block[i]) > 0 else np.zeros((0, 3))
 
-        # 核心改变：直接基于位姿采样完美包围盒表面，噪声设置为 0.0，彻底消除“毛绒”感
-        block_pts = sample_box_surface(
-            block_poses[i], half, n_pts=TARGET_DENSITY, noise_std=0.0
-        )
+        n_real = len(real_pts)
+
+        if n_real > 0:
+            if n_real > TARGET_DENSITY // 2:
+                real_ds = real_pts[np.random.choice(n_real, TARGET_DENSITY // 2, replace=False)]
+            else:
+                real_ds = real_pts
+
+            n_need = TARGET_DENSITY - len(real_ds)
+        
+            gt_candidates = sample_box_surface(block_poses[i], half, n_pts=n_need * 3, noise_std=0.0005,)
+
+            dists, _ = cKDTree(real_ds).query(gt_candidates, k=1)
+            gt_fill = gt_candidates[dists > DEDUP_RADIUS]
+            if len(gt_fill) >= n_need:
+                gt_fill = gt_fill[np.random.choice(len(gt_fill), n_need, replace=False)]
+                block_pts = np.concatenate([real_ds, gt_fill])
+            else:
+                block_pts = sample_box_surface(
+                    block_poses[i], half, n_pts=TARGET_DENSITY, noise_std=0.0008,
+                )
+        else:
+            # Fully occluded: pure GT completion
+            block_pts = sample_box_surface(
+                block_poses[i], half, n_pts=TARGET_DENSITY, noise_std=0.0008,
+            )
 
         amodal_xyz_list.append(block_pts)
         amodal_level_list.append(np.full(len(block_pts), level))

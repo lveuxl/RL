@@ -606,13 +606,15 @@ _**User**_
 
 ---
 
+  报错  @/Users/jianzihang/.cursor/projects/Users-jianzihang-Downloads-RL-Robot/terminals/3.txt:13-67 
+
+---
+
 _**Assistant**_
 
-收到，爱学习的小龙虾！
+看到错误了：`UnboundLocalError: local variable 'block_pts' referenced before assignment`
 
-需求很清晰：把 `figure1_perception_topology.py` 从 `JengaTower-v1`（完整塔）切换到 `JengaTower-RealisticA-v1`（残局场景）。残局有掏心、独木支撑、不对称结构，Figure 1 会更有视觉冲击力。
-
-让我先看清当前代码，确认需要修改的精确位置。
+问题出在 line 185，当某个积木完全被遮挡（`len(real_pts) == 0`）时，`block_pts` 没有被赋值就被引用了。让我修复这个逻辑错误：
 
 ---
 
@@ -620,13 +622,7 @@ _**Assistant**_
 
 ---
 
-改动分析：
-
-1. **环境**：`JengaTower-v1` → `JengaTower-RealisticA-v1`，需要 import `realistic_jenga` 来触发注册
-2. **过滤已移除的积木**：残局中被移到 (999,999,999) 的积木不应参与 amodal 补全和拓扑图，需要用 `KEEP_MASK` 过滤
-3. **拓扑图中只画实际存在的积木节点和支撑边**
-
-改动精准、最小化：
+找到问题了！当 `n_real > 0` 但 `len(gt_fill) <= n_need` 时，`block_pts` 在 else 分支被赋值，但当 `n_real == 0`（完全被遮挡）时，整个 if 块被跳过，`block_pts` 就未定义。修复：
 
 ---
 
@@ -634,47 +630,79 @@ _**Assistant**_
 
 ---
 
+修复完成！问题在于：
 
+1. **原逻辑缺陷**：当 `n_real == 0`（积木完全被遮挡）时，`if n_real > 0` 条件不满足，整个代码块被跳过，导致 `block_pts` 未定义就被 `append`
+2. **修复方案**：添加 `else` 分支处理完全遮挡的情况，直接用 GT 采样生成 `TARGET_DENSITY` 个点
+3. **额外修正**：`if len(gt_fill) > n_need` 改为 `>= n_need`，避免边界情况下的逻辑错误
 
----
+现在重新运行应该可以正常生成图像了：
 
-现在修改 amodal 部分——只对 present 中的积木做补全：
-
----
-
-
-
----
-
-现在修改拓扑图部分——只绘制 present 中的积木节点和它们之间的支撑边：
-
----
-
-
-
----
-
-同时 statistics 部分也应该只统计 present 中的积木：
-
----
-
-
-
----
-
-
+```bash
+python figure1_perception_topology.py
+```
 
 ---
 
 _**User**_
 
-继续
+我正在绘制我论文的 Figure 1，现在的 Amodal Completion (图 b) 看起来像一团互相粘连的噪声雾，无法体现出 Jenga 积木离散的实例特性。
+
+我需要你修改我代码中的 `sample_box_surface` 函数以及组装 `amodal_xyz` 的逻辑，使其既能反映出真实 3D 深度学习补全网络的“预测痕迹”，在视觉上又能清晰区分各个木块。
+
+请遵循以下具体的修改要求：
+
+1. **重构点云补全逻辑 (Holistic Prediction Simulation):**
+   - 放弃使用 `cKDTree` 将真实 partial points 和生成点进行拼接的逻辑。
+   - 真实的实例级补全网络（如 PCN）通常直接输出完整的物体点云。请直接为每个 `present` 的木块生成固定数量（例如 `N=800`）的点作为该木块的 amodal 预测结果。
+
+2. **引入“AI预测感”几何特征 (Network Artifacts):**
+   - **尺寸微缩 (Instance Shrinkage):** 网络为了避免碰撞 Loss，通常会把物体预测得稍微小一点。在生成表面点时，请将木块的 `half` extents 乘以一个缩小系数（例如 `0.90` 或 `0.92`）。这能物理上拉开相邻木块的缝隙，避免点云粘连。
+   - **平滑边角 (Rounded Edges):** 请修改 `sample_box_surface` 的生成方式。不要在完美的绝对平面上均匀采样然后加高斯噪声。你可以使用一种更像网络生成的分布：例如，先在椭球内/表面随机采样，然后 Clamp/Project 到长方体边界，或者使用带有些许聚集效应的非均匀分布，使得直角处有一定的倒角（Chamfering）和圆润感。
+
+3. **增强实例区分度的渲染 (Instance-Aware Coloring):**
+   - 在 `ax2.scatter` 绘制图 (b) 时，同一层的木块颜色目前是完全相同的（仅由 `level` 决定）。
+   - 请在代码中为每个独立木块引入微小的颜色扰动（Color Jittering）。例如，可以在层级颜色的基础上，根据 `block_id` 增加微小的高斯偏移，或者交替微调透明度/亮度，确保即使两个木块紧挨着，在视觉上也能看出这是两个独立生成的 Instance 点云。
+
+请给出修改后的完整 `sample_box_surface` 函数，以及对应组装和绘制 `amodal_xyz` 的核心代码段。代码需保持高质量且可直接运行。
 
 ---
 
 _**Assistant**_
 
-让我运行代码生成图像：
+完美的需求分析！你说得对——当前的 amodal 点云看起来像"噪声雾"，缺乏实例级补全网络的典型特征。让我按照你的三点要求重构代码：
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+
+
+---
+
+遇到了 segfault (exit code 139)。让我检查终端输出看具体错误：
+
+---
+
+
+
+---
+
+
+
+---
+
+
 
 ---
 
