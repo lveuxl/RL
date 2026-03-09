@@ -1,0 +1,671 @@
+{
+  "model": "vlm",
+  "model_name": "VLM Baseline (gemini-2.5-pro)",
+  "ood_mode": "sparse",
+  "seed": 42,
+  "num_episodes": 10,
+  "sr": 0.9325842696629213,
+  "meb_mean": 8.3,
+  "meb_std": 6.588626564011653,
+  "meb_max": 15,
+  "total_success": 83,
+  "total_attempts": 89,
+  "all_meb": [
+    1,
+    1,
+    15,
+    3,
+    0,
+    15,
+    14,
+    15,
+    15,
+    4
+  ],
+  "elapsed_time": 872.574296951294,
+  "decisions": [
+    [
+      {
+        "step": 0,
+        "block_id": 17,
+        "level": 5,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 11,
+        "level": 3,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 17,
+        "level": 5,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 53,
+        "level": 17,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 53,
+        "level": 17,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 45,
+        "level": 15,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 52,
+        "level": 17,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 51,
+        "level": 17,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 17,
+        "level": 5,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 50,
+        "level": 16,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 6,
+        "block_id": 37,
+        "level": 12,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 7,
+        "block_id": 49,
+        "level": 16,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 8,
+        "block_id": 48,
+        "level": 16,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 9,
+        "block_id": 25,
+        "level": 8,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 10,
+        "block_id": 47,
+        "level": 15,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 11,
+        "block_id": 46,
+        "level": 15,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 12,
+        "block_id": 12,
+        "level": 4,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 13,
+        "block_id": 22,
+        "level": 7,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 14,
+        "block_id": 44,
+        "level": 14,
+        "position": 2,
+        "success": true
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 17,
+        "level": 5,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 10,
+        "level": 3,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 40,
+        "level": 13,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 53,
+        "level": 17,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 23,
+        "level": 7,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 19,
+        "level": 6,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 53,
+        "level": 17,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 52,
+        "level": 17,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 45,
+        "level": 15,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 51,
+        "level": 17,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 15,
+        "level": 5,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 6,
+        "block_id": 50,
+        "level": 16,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 7,
+        "block_id": 49,
+        "level": 16,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 8,
+        "block_id": 48,
+        "level": 16,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 9,
+        "block_id": 47,
+        "level": 15,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 10,
+        "block_id": 46,
+        "level": 15,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 11,
+        "block_id": 17,
+        "level": 5,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 12,
+        "block_id": 44,
+        "level": 14,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 13,
+        "block_id": 31,
+        "level": 10,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 14,
+        "block_id": 43,
+        "level": 14,
+        "position": 1,
+        "success": true
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 19,
+        "level": 6,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 28,
+        "level": 9,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 53,
+        "level": 17,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 16,
+        "level": 5,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 52,
+        "level": 17,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 41,
+        "level": 13,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 6,
+        "block_id": 44,
+        "level": 14,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 7,
+        "block_id": 31,
+        "level": 10,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 8,
+        "block_id": 49,
+        "level": 16,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 9,
+        "block_id": 34,
+        "level": 11,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 10,
+        "block_id": 51,
+        "level": 17,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 11,
+        "block_id": 45,
+        "level": 15,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 12,
+        "block_id": 47,
+        "level": 15,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 13,
+        "block_id": 46,
+        "level": 15,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 14,
+        "block_id": 29,
+        "level": 9,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 53,
+        "level": 17,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 41,
+        "level": 13,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 25,
+        "level": 8,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 52,
+        "level": 17,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 51,
+        "level": 17,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 50,
+        "level": 16,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 6,
+        "block_id": 22,
+        "level": 7,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 7,
+        "block_id": 10,
+        "level": 3,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 8,
+        "block_id": 49,
+        "level": 16,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 9,
+        "block_id": 48,
+        "level": 16,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 10,
+        "block_id": 47,
+        "level": 15,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 11,
+        "block_id": 31,
+        "level": 10,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 12,
+        "block_id": 46,
+        "level": 15,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 13,
+        "block_id": 19,
+        "level": 6,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 14,
+        "block_id": 45,
+        "level": 15,
+        "position": 0,
+        "success": true
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 37,
+        "level": 12,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 53,
+        "level": 17,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 13,
+        "level": 4,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 52,
+        "level": 17,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 25,
+        "level": 8,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 51,
+        "level": 17,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 6,
+        "block_id": 50,
+        "level": 16,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 7,
+        "block_id": 41,
+        "level": 13,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 8,
+        "block_id": 22,
+        "level": 7,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 9,
+        "block_id": 49,
+        "level": 16,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 10,
+        "block_id": 48,
+        "level": 16,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 11,
+        "block_id": 47,
+        "level": 15,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 12,
+        "block_id": 10,
+        "level": 3,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 13,
+        "block_id": 46,
+        "level": 15,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 14,
+        "block_id": 45,
+        "level": 15,
+        "position": 0,
+        "success": true
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 19,
+        "level": 6,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 34,
+        "level": 11,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 53,
+        "level": 17,
+        "position": 2,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 52,
+        "level": 17,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 35,
+        "level": 11,
+        "position": 2,
+        "success": false
+      }
+    ]
+  ]
+}

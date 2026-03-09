@@ -131,27 +131,22 @@ def encode_image_base64(image_np: np.ndarray) -> str:
 # ════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = (
-    "你是一个精通结构力学和积木物理的专家。"
-    "你将看到 Jenga 塔的图像，每块积木上标注了数字 ID。"
-    "塔由 18 层组成，每层 3 块（编号 = 层号×3 + 层内位置 0/1/2），"
-    "相邻层旋转 90°。你的任务是选出抽取后最不可能导致塔倒塌的积木。"
+    "You are a Jenga expert. "
+    "Your task is to select the safest block to extract from the tower without causing it to collapse."
 )
 
 
 def build_user_prompt(valid_ids, removed_ids):
     valid_str = ", ".join(map(str, sorted(valid_ids)))
-    removed_str = ", ".join(map(str, sorted(removed_ids))) if removed_ids else "无"
+    removed_str = ", ".join(map(str, sorted(removed_ids))) if removed_ids else "None"
+    
     return (
-        f"图中是当前 Jenga 塔。标注数字 = 积木 ID。\n\n"
-        f"当前可抽取 ID: [{valid_str}]\n"
-        f"已抽走 ID: [{removed_str}]\n\n"
-        f"请逐步分析:\n"
-        f"1. 观察各层缺失情况\n"
-        f"2. 判断每块积木是否为关键支撑（底层、唯一支撑者不可抽）\n"
-        f"3. 顶层和有 3 块完整的层中的中间块通常最安全\n"
-        f"4. 已有缺口的层中的剩余积木风险更高\n\n"
-        f"请以 JSON 输出推荐:\n"
-        f'```json\n{{"block_id": <ID>, "reasoning": "<理由>"}}\n```'
+        f"Current tower state:\n"
+        f"Available blocks: [{valid_str}]\n"
+        f"Already removed: [{removed_str}]\n\n"
+        f"Which block should I extract? Choose the safest one.\n\n"
+        f"Respond with JSON:\n"
+        f'```json\n{{"block_id": <ID>, "reasoning": "<brief explanation>"}}\n```'
     )
 
 
@@ -221,6 +216,14 @@ def query_vlm(api_key, base_url, image_b64, valid_ids, removed_ids,
             data = resp.json()
             text = data["choices"][0]["message"]["content"]
             return parse_vlm_response(text, set(valid_ids)), text
+        except requests.exceptions.HTTPError as e:
+            # 429/503 需要更长的等待时间
+            if e.response.status_code in [429, 503] and attempt < retries:
+                wait_time = min(10 * (2 ** attempt), 60)  # 最多等 60 秒
+                print(f"    API 限流/不可用 ({e.response.status_code}), {wait_time}s 后重试...")
+                time.sleep(wait_time)
+                continue
+            raise
         except Exception as e:
             if attempt < retries:
                 time.sleep(2 ** attempt)
@@ -309,7 +312,11 @@ def main():
                     os.path.join(args.image_dir, f"ep{ep:02d}_step{step:02d}.png")
                 )
 
-            # ② 查询 VLM
+            # ② 请求间隔控制（避免 429）
+            if step > 0 or ep > 0:
+                time.sleep(2)  # 每次请求前等待 2 秒
+
+            # ③ 查询 VLM
             img_b64 = encode_image_base64(final_img)
             try:
                 block_id, resp_text = query_vlm(
@@ -325,7 +332,7 @@ def main():
                 block_id = max(valid_ids)
                 print(f"  Step {step + 1}: 解析失败, 回退 #{block_id}")
 
-            # ③ 执行动作
+            # ④ 执行动作
             obs, reward, done, _, info = env.step(block_id)
             total_attempts += 1
             collapsed = info.get("collapsed", False)

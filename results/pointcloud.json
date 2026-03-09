@@ -1,0 +1,468 @@
+{
+  "model": "pointcloud_heuristic",
+  "model_name": "Point Cloud Heuristic (\u516c\u5e73\u5bf9\u6bd4 - \u70b9\u4e91\u8f93\u5165)",
+  "ood_mode": null,
+  "seed": 42,
+  "num_episodes": 10,
+  "sr": 0.8333333333333334,
+  "meb_mean": 5.0,
+  "meb_std": 3.0,
+  "meb_max": 12,
+  "total_success": 50,
+  "total_attempts": 60,
+  "all_meb": [
+    5,
+    4,
+    2,
+    7,
+    7,
+    3,
+    6,
+    2,
+    12,
+    2
+  ],
+  "elapsed_time": 21.008487224578857,
+  "decisions": [
+    [
+      {
+        "step": 0,
+        "block_id": 15,
+        "level": 5,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 21,
+        "level": 7,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 33,
+        "level": 11,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 27,
+        "level": 9,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 9,
+        "level": 3,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 39,
+        "level": 13,
+        "position": 0,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 9,
+        "level": 3,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 6,
+        "level": 2,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 7,
+        "level": 2,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 15,
+        "level": 5,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 8,
+        "level": 2,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 9,
+        "level": 3,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 15,
+        "level": 5,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 6,
+        "level": 2,
+        "position": 0,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 15,
+        "level": 5,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 39,
+        "level": 13,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 21,
+        "level": 7,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 27,
+        "level": 9,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 33,
+        "level": 11,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 13,
+        "level": 4,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 6,
+        "block_id": 16,
+        "level": 5,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 7,
+        "block_id": 14,
+        "level": 4,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 15,
+        "level": 5,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 21,
+        "level": 7,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 27,
+        "level": 9,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 33,
+        "level": 11,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 39,
+        "level": 13,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 13,
+        "level": 4,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 6,
+        "block_id": 16,
+        "level": 5,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 7,
+        "block_id": 22,
+        "level": 7,
+        "position": 1,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 9,
+        "level": 3,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 7,
+        "level": 2,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 51,
+        "level": 17,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 8,
+        "level": 2,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 39,
+        "level": 13,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 33,
+        "level": 11,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 9,
+        "level": 3,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 27,
+        "level": 9,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 21,
+        "level": 7,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 7,
+        "level": 2,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 6,
+        "block_id": 8,
+        "level": 2,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 9,
+        "level": 3,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 6,
+        "level": 2,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 7,
+        "level": 2,
+        "position": 1,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 15,
+        "level": 5,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 21,
+        "level": 7,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 27,
+        "level": 9,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 3,
+        "block_id": 9,
+        "level": 3,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 4,
+        "block_id": 33,
+        "level": 11,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 5,
+        "block_id": 39,
+        "level": 13,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 6,
+        "block_id": 43,
+        "level": 14,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 7,
+        "block_id": 10,
+        "level": 3,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 8,
+        "block_id": 16,
+        "level": 5,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 9,
+        "block_id": 22,
+        "level": 7,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 10,
+        "block_id": 12,
+        "level": 4,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 11,
+        "block_id": 13,
+        "level": 4,
+        "position": 1,
+        "success": true
+      },
+      {
+        "step": 12,
+        "block_id": 14,
+        "level": 4,
+        "position": 2,
+        "success": false
+      }
+    ],
+    [
+      {
+        "step": 0,
+        "block_id": 15,
+        "level": 5,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 1,
+        "block_id": 21,
+        "level": 7,
+        "position": 0,
+        "success": true
+      },
+      {
+        "step": 2,
+        "block_id": 27,
+        "level": 9,
+        "position": 0,
+        "success": false
+      }
+    ]
+  ]
+}
