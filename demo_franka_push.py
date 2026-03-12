@@ -14,6 +14,7 @@ Usage:
 import argparse
 import sys
 import os
+import time
 
 import numpy as np
 import torch
@@ -349,11 +350,18 @@ def animate_franka_pushing_with_planner(env, planner, selected_actor, steps=60, 
                     pre_push_pos = approx.p
 
         if not reached_phase1:
-            print(f"   ⚠️ 所有可达性搜索失败, 木块渐进推出")
-            _slide_out_block(env, selected_actor, push_dir, device)
-            _hold_steps(env, 5)
-            print(f"   ✓ 木块已推出 (渐进滑出)")
-            return
+            # 即使预备点不可达, 也尝试移动到木块附近的高空位置, 做出"接近"姿态
+            print(f"   ⚠️ 预备点不可达, 尝试移动到木块上方...")
+            above_pos = block_pos.copy()
+            above_pos[2] += 0.15
+            above_pose = sapien.Pose(p=above_pos, q=push_pose.q)
+            result = planner.move_to_pose_with_screw(above_pose)
+            if result == -1:
+                result = planner.move_to_pose_with_RRTConnect(above_pose)
+            if result == -1:
+                approx = _find_reachable_pose(planner, above_pos, push_pose.q, push_dir, method="rrt")
+                if approx is not None:
+                    planner.move_to_pose_with_RRTConnect(approx)
 
         _hold_steps(env, 15)
 
@@ -366,6 +374,9 @@ def animate_franka_pushing_with_planner(env, planner, selected_actor, steps=60, 
             approx = _find_reachable_pose(planner, contact, push_pose.q, push_dir, method="screw")
             if approx is not None:
                 result = planner.move_to_pose_with_screw(approx)
+            if result == -1:
+                # 最后尝试用 RRT 到接触点
+                result = planner.move_to_pose_with_RRTConnect(push_pose)
             if result == -1:
                 print(f"   ⚠️ 接触点不可达, 从当前位置继续推动")
 
@@ -539,7 +550,12 @@ if __name__ == "__main__":
     # Planner 内部的 follow_path、open/close_gripper 都调 env.step(),
     # 被 wrapper 自动捕获, 彻底解决丢帧问题。
     output_dir = os.path.dirname(args.output) or "."
-    video_name = os.path.splitext(os.path.basename(args.output))[0]
+    base_name = os.path.splitext(os.path.basename(args.output))[0]
+    expected_path = os.path.join(output_dir, f"{base_name}.mp4")
+    if os.path.exists(expected_path):
+        video_name = f"{base_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    else:
+        video_name = base_name
 
     env = RecordEpisode(
         env,
@@ -644,18 +660,19 @@ if __name__ == "__main__":
     if planner is not None:
         planner.close()
 
-    # save_on_reset=False 时, close() 不会自动 flush 视频, 需要手动调用
-    env.flush_video()
+    # save_on_reset=False 时, close() 不会自动 flush 视频; 传入 name 避免总是保存为 0.mp4
+    env.flush_video(name=video_name)
     env.close()
 
-    # RecordEpisode 按 trajectory_name 命名视频,
-    # 输出路径为 output_dir/{trajectory_name}.mp4
     expected_path = os.path.join(output_dir, f"{video_name}.mp4")
     if os.path.exists(expected_path):
-        # 如果用户指定了不同的输出路径, 移动文件
-        if os.path.abspath(expected_path) != os.path.abspath(args.output):
+        if video_name != base_name:
+            print(f"✓ 视频已保存: {expected_path} (未覆盖已有文件)")
+        elif os.path.abspath(expected_path) != os.path.abspath(args.output):
             import shutil
             shutil.move(expected_path, args.output)
-        print(f"✓ 视频已保存: {args.output}")
+            print(f"✓ 视频已保存: {args.output}")
+        else:
+            print(f"✓ 视频已保存: {args.output}")
     else:
         print(f"✓ 视频应已保存到 {output_dir}/ 目录下")
