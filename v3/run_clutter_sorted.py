@@ -10,9 +10,9 @@ import torch
 from tqdm import tqdm
 
 # 添加路径
-sys.path.append('/home/linux/jzh/RL_Robot')
-sys.path.append('/home/linux/jzh/RL_Robot/base_env')
-sys.path.append('/home/linux/jzh/RL_Robot/examples/motionplanning/panda')
+sys.path.append('/home/linux/jzh/RL')
+sys.path.append('/home/linux/jzh/RL/base_env')
+sys.path.append('/home/linux/jzh/RL/examples/motionplanning/panda')
 
 # 导入必要的模块
 from mani_skill.examples.motionplanning.panda.motionplanner import PandaArmMotionPlanningSolver

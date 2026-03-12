@@ -365,9 +365,10 @@ class JengaTowerEnv(BaseEnv):
     def _default_human_render_camera_configs(self):
         tower_h = self.num_levels * BLOCK_H
         pose = sapien_utils.look_at(
-            eye=[0.45, 0.35, tower_h * 0.8], target=[0.0, 0.0, tower_h * 0.4]
+            eye=[0.75, 0.55, tower_h * 1.0 + 0.15],
+            target=[0.0, 0.0, tower_h * 0.35],
         )
-        return CameraConfig("render_camera", pose, 512, 512, 1, 0.01, 100)
+        return CameraConfig("render_camera", pose, 1024, 1024, 1.2, 0.01, 100)
 
     def _load_agent(self, options: dict):
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))

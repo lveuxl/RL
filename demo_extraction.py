@@ -20,7 +20,7 @@ from mani_skill.utils.structs.pose import Pose
 from jenga_tower import (
     BLOCK_L, BLOCK_W, BLOCK_H, BLOCK_DENSITY,
     NUM_LEVELS, NUM_BLOCKS,
-    get_support_graph,
+    get_support_graph
 )
 
 
