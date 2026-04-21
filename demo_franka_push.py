@@ -353,7 +353,7 @@ def animate_franka_pushing_with_planner(env, planner, selected_actor, steps=60, 
             # 即使预备点不可达, 也尝试移动到木块附近的高空位置, 做出"接近"姿态
             print(f"   ⚠️ 预备点不可达, 尝试移动到木块上方...")
             above_pos = block_pos.copy()
-            above_pos[2] += 0.15
+            above_pos[2] += 0.05
             above_pose = sapien.Pose(p=above_pos, q=push_pose.q)
             result = planner.move_to_pose_with_screw(above_pose)
             if result == -1:
