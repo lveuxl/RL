@@ -109,6 +109,12 @@ class PickUpSticksEnv(BaseEnv):
         self._funnel_disabled: bool = False
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
+        # 初始化完成后，强制将动作空间覆盖为我们的离散宏动作空间
+        self.single_action_space = spaces.Discrete(self.num_sticks)
+        if self.num_envs == 1:
+            self.action_space = self.single_action_space
+        else:
+            self.action_space = spaces.MultiDiscrete([self.num_sticks] * self.num_envs)
     # =====================================================================
     # 1. Sim Config — 防爆调优
     # =====================================================================
@@ -185,19 +191,31 @@ class PickUpSticksEnv(BaseEnv):
         for i in range(self.num_sticks):
             builder = self.scene.create_actor_builder()
 
-            # 碰撞体: 细长 Box 近似圆柱 (Box 接触更稳定, capsule 在密堆下易穿模)
-            builder.add_box_collision(
-                half_size=STICK_HALF,
-                material=stick_mat,
-                density=STICK_DENSITY,
-            )
+            # # 碰撞体: 细长 Box 近似圆柱 (Box 接触更稳定, capsule 在密堆下易穿模)
+            # builder.add_box_collision(
+            #     half_size=STICK_HALF,
+            #     material=stick_mat,
+            #     density=STICK_DENSITY,
+            # )
 
             # 可视材质
             color = STICK_COLORS[i % len(STICK_COLORS)]
             render_mat = sapien.render.RenderMaterial(
                 base_color=color, roughness=0.7, specular=0.1, metallic=0.0
             )
-            builder.add_box_visual(half_size=STICK_HALF, material=render_mat)
+            # builder.add_box_visual(half_size=STICK_HALF, material=render_mat)
+
+            builder.add_capsule_collision(
+                radius=STICK_RADIUS, 
+                half_length=STICK_LENGTH / 2, 
+                material=stick_mat, 
+                density=STICK_DENSITY
+            )
+            builder.add_capsule_visual(
+                radius=STICK_RADIUS, 
+                half_length=STICK_LENGTH / 2, 
+                material=render_mat
+            )
 
             # 初始错层位姿: 在漏斗上方螺旋分布, 避免初始穿模
             # (实际沉降位姿由 _initialize_episode 设置)
@@ -291,11 +309,13 @@ class PickUpSticksEnv(BaseEnv):
         """
         if self._funnel_disabled:
             return
-        far_pose = sapien.Pose(p=[0.0, 0.0, -10.0])  # 藏到地面下方
+        far_pose_tensor = torch.tensor([[0.0, 0.0, -10.0]], device=self.device).expand(self.num_envs, -1)
+        far_pose = Pose.create_from_pq(far_pose_tensor)
         for wall in self._funnel_walls:
             try:
                 wall.set_pose(far_pose)
-            except Exception:
+            except Exception as e:
+                print(f"警告: 漏斗隐藏失败 {e}")
                 pass
         self._funnel_disabled = True
 
@@ -376,22 +396,7 @@ class PickUpSticksEnv(BaseEnv):
                 pass
 
     # =====================================================================
-    # 6. 动作空间: 离散宏动作 (选哪根棒子)
-    # =====================================================================
-    @property
-    def single_action_space(self):
-        """Discrete(N): 选择要挑起的棒子索引."""
-        return spaces.Discrete(self.num_sticks)
-
-    @property
-    def action_space(self):
-        if self.num_envs == 1:
-            return self.single_action_space
-        # 多环境: Vector
-        return spaces.MultiDiscrete([self.num_sticks] * self.num_envs)
-
-    # =====================================================================
-    # 7. 启发式抓取 (占位): 接收 stick_id, 执行底层轨迹
+    # 6. 启发式抓取 (占位): 接收 stick_id, 执行底层轨迹
     # =====================================================================
     def _execute_heuristic_grasp(self, stick_id: int) -> Dict[str, Any]:
         """
@@ -447,7 +452,7 @@ class PickUpSticksEnv(BaseEnv):
         }
 
     # =====================================================================
-    # 8. step 重写: 接收离散动作, 调用启发式抓取
+    # 7. step 重写: 接收离散动作, 调用启发式抓取
     # =====================================================================
     def step(self, action):
         """
@@ -503,7 +508,7 @@ class PickUpSticksEnv(BaseEnv):
         return obs, reward, terminated, truncated, info
 
     # =====================================================================
-    # 9. 观测: Privileged State (所有棒子的 6DoF)
+    # 8. 观测: Privileged State (所有棒子的 6DoF)
     # =====================================================================
     def _get_obs_extra(self, info: Dict):
         """
@@ -525,7 +530,7 @@ class PickUpSticksEnv(BaseEnv):
         return obs
 
     # =====================================================================
-    # 10. Dependency Graph (辅助函数框架 — 哪根棒子压在哪根上面)
+    # 9. Dependency Graph (辅助函数框架 — 哪根棒子压在哪根上面)
     # =====================================================================
     def compute_dependency_graph(self, force_threshold_ratio: float = 0.1) -> np.ndarray:
         """
@@ -563,7 +568,7 @@ class PickUpSticksEnv(BaseEnv):
         return dep
 
     # =====================================================================
-    # 11. 评估 & 奖励
+    # 10. 评估 & 奖励
     # =====================================================================
     def evaluate(self) -> Dict[str, torch.Tensor]:
         if self._removed_mask is None:
@@ -648,23 +653,35 @@ if __name__ == "__main__":
     if hasattr(viewer, "paused"):
         viewer.paused = True
 
-    # ── 随机顺序挑棒子 (演示宏动作接口) ──
-    remaining = list(range(uw.num_sticks))
-    rng = np.random.default_rng(0)
-    rng.shuffle(remaining)
-
-    try:
-        for sid in remaining:
-            print(f"  尝试挑起 stick_{sid} ...")
-            obs, reward, terminated, truncated, info = env.step(sid)
+    print("环境已初始化。请在弹出的窗口中查看桌上的棒子！")
+    print("如果画面暂停，可以按空格键播放。关闭窗口以退出。")
+    
+    # 用死循环卡住画面，不要去执行自动抓取
+    while True:
+        try:
             env.render()
-            print(f"    reward = {float(reward):.2f}  "
-                  f"扰动 max_disp = {info.get('others_max_displacement', 0):.4f}m  "
-                  f"disturbed = {info.get('others_disturbed', False)}")
-            if bool(terminated.any() if hasattr(terminated, 'any') else terminated):
-                print(f"\n  ⚠ Episode 终止. 成功移除: {int(info.get('num_removed', 0))}/{uw.num_sticks}")
-                break
-    except KeyboardInterrupt:
-        pass
-    finally:
-        env.close()
+        except (TypeError, AttributeError):
+            break
+            
+    env.close()
+
+    # # ── 随机顺序挑棒子 (演示宏动作接口) ──
+    # remaining = list(range(uw.num_sticks))
+    # rng = np.random.default_rng(0)
+    # rng.shuffle(remaining)
+
+    # try:
+    #     for sid in remaining:
+    #         print(f"  尝试挑起 stick_{sid} ...")
+    #         obs, reward, terminated, truncated, info = env.step(sid)
+    #         env.render()
+    #         print(f"    reward = {float(reward):.2f}  "
+    #               f"扰动 max_disp = {info.get('others_max_displacement', 0):.4f}m  "
+    #               f"disturbed = {info.get('others_disturbed', False)}")
+    #         if bool(terminated.any() if hasattr(terminated, 'any') else terminated):
+    #             print(f"\n  ⚠ Episode 终止. 成功移除: {int(info.get('num_removed', 0))}/{uw.num_sticks}")
+    #             break
+    # except KeyboardInterrupt:
+    #     pass
+    # finally:
+    #     env.close()
