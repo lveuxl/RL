@@ -63,7 +63,7 @@ FUNNEL_TOP_Z = 0.35              # 漏斗上沿高度
 FUNNEL_BOTTOM_Z = 0.05           # 漏斗下沿高度 (紧贴桌面)
 FUNNEL_TOP_HALF = 0.15           # 上沿半宽
 FUNNEL_BOTTOM_HALF = 0.06        # 下沿半宽 (引导棒子聚拢至此半径内)
-SETTLING_STEPS = 400             # 物理沉降步数
+SETTLING_STEPS = 2000             # 物理沉降步数
 
 # ─── 抓取成功判定阈值 ───────────────────────────────
 PERTURB_THRESHOLD = 0.003        # 其他棒子位移 < 3mm 视为"没扰动"
@@ -382,6 +382,14 @@ class PickUpSticksEnv(BaseEnv):
 
             # ── 5.3 沉降完成, 移除漏斗 (关键步骤!) ──
             self._disable_funnel()
+
+            tiny_vel = torch.tensor([[0.0, 0.0, -0.05]], device=self.device).expand(b, -1)
+            for stick in self.sticks:
+                stick.set_linear_velocity(tiny_vel)
+            
+            # 再额外空跑 100 步，确保它们稳稳落在真实桌面上
+            for _ in range(100):
+                self.scene.step()
 
     def _funnel_reset(self):
         """Episode 重置时把漏斗移回原位 (若上一个 episode 已被禁用)."""
