@@ -702,16 +702,16 @@ if __name__ == "__main__":
     )
 
     obs, _ = env.reset(seed=42)
+    uw = env.unwrapped
     print(f"观测维度: {env.observation_space}")
     print(f"动作空间: {env.action_space}")
     print(f"棒子数量: {NUM_STICKS}")
 
-    # 预热: 零动作步进, 让接触力稳定
-    for _ in range(5):
-        env.step(0)
+    # 预热: 额外物理步进, 让接触力稳定 (不执行宏动作)
+    for _ in range(50):
+        uw.scene.step()
 
     # ─── 提取 Dependency Graph ───
-    uw = env.unwrapped
     graph = get_dependency_graph(uw.scene, uw.sticks)
 
     print(f"\n{'='*50}")
@@ -746,7 +746,7 @@ if __name__ == "__main__":
         # 随机选择一根棒子尝试挑起
         action = env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
-        print(f"Action: stick_{action}, Reward: {reward:.3f}, "
+        print(f"Action: stick_{action}, Reward: {reward.item():.3f}, "
               f"Removed: {uw.num_removed.item()}/{NUM_STICKS}")
         try:
             env.render()
