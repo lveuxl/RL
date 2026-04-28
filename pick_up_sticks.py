@@ -1,25 +1,32 @@
 """
-PickUpSticks-v1: 挑棒子 (Mikado / Pick-up Sticks) 仿真环境 (ManiSkill BaseEnv)
+PickUpSticks-v1: 挑棒子 (Pick-up Sticks) 仿真环境 (ManiSkill BaseEnv)
 
-设计要点:
-    1. 宏动作 (Macro-action) 接口: action 是离散的 stick_id, RL 智能体只学习"挑哪根"的顺序。
-       底层抓取轨迹由 _execute_heuristic_grasp(stick_id) 占位实现。
-    2. 防爆物理调优: 高 sim_freq + 高 solver iterations + 零恢复系数 + 高阻尼。
-    3. 不可见漏斗 (Invisible Funnel): 4 块倾斜静态 Box 形成倒锥, 让棒子掉落后聚拢于桌面中心。
-    4. 物理沉降阶段: 空跑数百步令棒子静止, 然后**移除漏斗碰撞体**以不阻碍机械臂。
+Task Description:
+    桌面上散落着 N 根彩色细棒 (圆柱体)。RL 智能体需要学习 **最佳挑取顺序**，
+    每一步选择一根棒子 ID，环境内部通过启发式宏动作完成抓取闭环。
+
+Architecture:
+    - 离散动作空间 Discrete(N)：选择要挑起的棒子编号
+    - 宏动作 (Macro-action)：_execute_heuristic_grasp(stick_id) 内部完成
+      多步底层仿真，RL 不控制连续轨迹
+    - 物理沉降 + 不可见漏斗：棒子从高处错层生成，经漏斗聚拢后自然堆叠，
+      沉降完成后移除漏斗
 
 Usage:
-    conda activate /opt/anaconda3/envs/skill
+    conda activate <your_env>
     python pick_up_sticks.py
 """
+from __future__ import annotations
+
 from typing import Any, Dict, List, Optional, Union
+from collections import deque
 
 import numpy as np
 import sapien
+import sapien.physx
 import sapien.render
 import torch
 import gymnasium as gym
-from gymnasium import spaces
 
 from mani_skill.agents.robots import Panda
 from mani_skill.envs.sapien_env import BaseEnv
@@ -30,62 +37,156 @@ from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.structs.types import SceneConfig, SimConfig
 
+# ═══════════════════════════════════════════════════════════
+#  棒子几何与物理参数
+# ═══════════════════════════════════════════════════════════
+STICK_RADIUS = 0.004       # 棒子半径 4 mm
+STICK_HALF_LENGTH = 0.075  # 棒子半长 7.5 cm (全长 15 cm)
+NUM_STICKS = 15            # 默认棒子数量
+STICK_DENSITY = 800        # kg/m³ (略重于木头，便于沉降)
 
-# ─── 棒子几何参数 (m) ───────────────────────────────
-STICK_LENGTH = 0.18      # 棒子长度 18 cm (类似真实 Mikado 牙签放大版)
-STICK_RADIUS = 0.003     # 棒子半径 3 mm (用细长 Box 近似, half_size = [L/2, R, R])
-STICK_HALF = [STICK_LENGTH / 2, STICK_RADIUS, STICK_RADIUS]
-NUM_STICKS = 15          # 棒子数量 N (= 离散动作空间维度)
-STICK_DENSITY = 500      # kg/m³ (木质轻棒)
-
-# 颜色配置: 每根棒子一种醒目颜色, 便于视觉辨识
+# 棒子颜色池 (经典挑棒子游戏的 5 种颜色)
 STICK_COLORS = [
-    [0.90, 0.15, 0.15, 1.0],  # 红
-    [0.20, 0.70, 0.25, 1.0],  # 绿
-    [0.15, 0.35, 0.85, 1.0],  # 蓝
-    [0.95, 0.80, 0.15, 1.0],  # 黄
-    [0.85, 0.40, 0.85, 1.0],  # 品红
-    [0.20, 0.80, 0.85, 1.0],  # 青
-    [0.95, 0.55, 0.15, 1.0],  # 橙
-    [0.55, 0.30, 0.75, 1.0],  # 紫
-    [0.15, 0.15, 0.15, 1.0],  # 黑
-    [0.95, 0.95, 0.95, 1.0],  # 白
-    [0.60, 0.40, 0.20, 1.0],  # 棕
-    [0.85, 0.60, 0.70, 1.0],  # 粉
-    [0.40, 0.60, 0.30, 1.0],  # 军绿
-    [0.30, 0.50, 0.80, 1.0],  # 淡蓝
-    [0.80, 0.20, 0.50, 1.0],  # 玫红
+    [1.0, 0.0, 0.0, 1.0],   # Red
+    [0.0, 0.0, 1.0, 1.0],   # Blue
+    [0.0, 0.8, 0.0, 1.0],   # Green
+    [1.0, 1.0, 0.0, 1.0],   # Yellow
+    [0.6, 0.0, 0.8, 1.0],   # Purple
 ]
 
-# ─── 漏斗几何参数 ───────────────────────────────
-FUNNEL_CENTER_XY = (0.0, 0.0)    # 漏斗水平中心 (桌面坐标系)
-FUNNEL_TOP_Z = 0.35              # 漏斗上沿高度
-FUNNEL_BOTTOM_Z = 0.05           # 漏斗下沿高度 (紧贴桌面)
-FUNNEL_TOP_HALF = 0.15           # 上沿半宽
-FUNNEL_BOTTOM_HALF = 0.06        # 下沿半宽 (引导棒子聚拢至此半径内)
-SETTLING_STEPS = 400             # 物理沉降步数
+# 漏斗参数
+FUNNEL_HALF_THICKNESS = 0.005   # 漏斗壁厚 (半厚度)
+FUNNEL_HEIGHT = 0.15            # 漏斗壁高度
+FUNNEL_TOP_HALF_WIDTH = 0.12    # 漏斗顶部半宽 (开口大)
+FUNNEL_BOTTOM_HALF_WIDTH = 0.04 # 漏斗底部半宽 (出口小)
 
-# ─── 抓取成功判定阈值 ───────────────────────────────
-PERTURB_THRESHOLD = 0.003        # 其他棒子位移 < 3mm 视为"没扰动"
+# 物理沉降步数
+SETTLE_STEPS = 500
 
 
-@register_env("PickUpSticks-v1", max_episode_steps=NUM_STICKS)
+# ═══════════════════════════════════════════════════════════
+#  辅助函数: Dependency Graph (谁压在谁上面)
+# ═══════════════════════════════════════════════════════════
+def get_dependency_graph(scene, sticks: list, force_threshold_ratio: float = 0.05):
+    """
+    从 SAPIEN 物理场景提取棒子之间的依赖关系图 (Dependency Graph)。
+
+    通过分析接触力判断 "谁压在谁上面":
+      - 如果 stick_i 对 stick_j 施加了向上的法向力 (超过阈值)，
+        则认为 stick_i 支撑 stick_j，即 stick_j 依赖 stick_i。
+
+    Args:
+        scene:  ManiSkillScene，提供 get_contacts() / timestep
+        sticks: list[Actor]，场景中所有棒子
+        force_threshold_ratio: 判定支撑的力阈值占单根棒子重力的比例
+
+    Returns:
+        dict:
+          "heights":          list[float]      — 每根棒子重心的 Z 高度 (m)
+          "dependency_matrix": list[list[int]] — D[i][j]=1 表示 stick_j 压在 stick_i 上
+                                                 (即移除 stick_i 可能影响 stick_j)
+          "on_top_count":     list[int]        — 每根棒子上方被压着的棒子数量
+    """
+    n = len(sticks)
+    dt = scene.timestep
+
+    # 单根棒子的体积和重力
+    vol = np.pi * STICK_RADIUS ** 2 * (2 * STICK_HALF_LENGTH)
+    single_weight = vol * STICK_DENSITY * 9.81
+    threshold = force_threshold_ratio * single_weight
+
+    # entity → 棒子索引映射
+    entity_to_idx = {s._bodies[0].entity: i for i, s in enumerate(sticks)}
+
+    heights = [float(s.pose.p[0, 2]) for s in sticks]
+
+    dependency_matrix = [[0] * n for _ in range(n)]
+
+    for contact in scene.get_contacts():
+        e0, e1 = contact.bodies[0].entity, contact.bodies[1].entity
+        if e0 not in entity_to_idx or e1 not in entity_to_idx:
+            continue
+        idx0, idx1 = entity_to_idx[e0], entity_to_idx[e1]
+
+        # PhysX 约定: point.impulse 施加在 bodies[0] 上
+        fz = sum(pt.impulse[2] for pt in contact.points) / dt
+
+        if -fz > threshold:
+            # bodies[0] 向上推 bodies[1] → stick_0 支撑 stick_1
+            dependency_matrix[idx0][idx1] = 1
+        if fz > threshold:
+            # bodies[1] 向上推 bodies[0] → stick_1 支撑 stick_0
+            dependency_matrix[idx1][idx0] = 1
+
+    # 统计每根棒子上方被压着的棒子数量
+    on_top_count = [sum(row) for row in dependency_matrix]
+
+    return {
+        "heights": heights,
+        "dependency_matrix": dependency_matrix,
+        "on_top_count": on_top_count,
+    }
+
+
+def get_removal_difficulty(dependency_matrix: list, heights: list) -> np.ndarray:
+    """
+    基于依赖图计算每根棒子的 "移除难度" 分数。
+
+    难度越高 → 该棒子上方压着越多其他棒子，移除风险越大。
+
+    Args:
+        dependency_matrix: (N, N) D[i][j]=1 表示 stick_i 支撑 stick_j
+        heights:           (N,) 每根棒子重心 Z 高度
+
+    Returns:
+        difficulty: np.ndarray (N,) — 移除难度分数 ∈ [0, 1]
+    """
+    n = len(heights)
+    A = np.asarray(dependency_matrix, dtype=int)
+
+    # BFS: 对每根棒子 i，求其传递支撑闭包 (移除 i 后可能受影响的所有棒子)
+    children = [np.where(A[i] > 0)[0] for i in range(n)]
+
+    cascade_sizes = []
+    for i in range(n):
+        visited = set(children[i].tolist())
+        queue = deque(visited)
+        while queue:
+            for c in children[queue.popleft()]:
+                if c not in visited:
+                    visited.add(c)
+                    queue.append(c)
+        cascade_sizes.append(len(visited))
+
+    cascade_sizes = np.array(cascade_sizes, dtype=float)
+    # Normalize to [0, 1]
+    if cascade_sizes.max() > 0:
+        difficulty = cascade_sizes / cascade_sizes.max()
+    else:
+        difficulty = np.zeros(n)
+
+    return difficulty
+
+
+# ═══════════════════════════════════════════════════════════
+#  PickUpSticks-v1 环境主体
+# ═══════════════════════════════════════════════════════════
+@register_env("PickUpSticks-v1", max_episode_steps=100)
 class PickUpSticksEnv(BaseEnv):
     """
     **Task Description:**
-    挑棒子 (Pick-up Sticks / Mikado) 任务.
-    桌面上堆叠 N 根彩色细棒, 互相交叠压迫. RL 智能体需要学习**最佳抽取顺序**,
-    每次选择一根棒子尝试挑起, 目标是: 不扰动其他棒子的前提下, 尽可能多地移除棒子.
+    挑棒子 (Pick-up Sticks) — 桌面上散落 N 根彩色细棒，
+    RL 智能体学习最佳挑取顺序 (离散宏动作)。
 
-    **Action Space (Macro):**
-    Discrete(N) — 离散动作, 选择要挑起的棒子索引 ∈ [0, N).
-    底层轨迹由 _execute_heuristic_grasp(stick_id) 启发式实现 (占位).
+    **Action Space:**
+    Discrete(N) — 选择要挑起的棒子编号。
+    环境内部通过 _execute_heuristic_grasp() 完成抓取闭环。
 
-    **Observation (Privileged State):**
-    每根棒子的 6DoF 姿态 (position + quaternion) + 是否已被移除的标志.
+    **Observation:**
+    Privileged State — 所有棒子的 6DoF 姿态 + 移除状态掩码。
 
     **Success Conditions:**
-    全部 N 根棒子被成功依次取走 (不扰动剩余棒子).
+    所有棒子均被成功挑起 (removed_mask 全为 True)。
     """
 
     SUPPORTED_ROBOTS = ["panda", "panda_stick"]
@@ -95,528 +196,502 @@ class PickUpSticksEnv(BaseEnv):
     def __init__(
         self,
         *args,
-        robot_uids: str = "panda",
-        robot_init_qpos_noise: float = 0.02,
+        robot_uids="panda",
+        robot_init_qpos_noise=0.02,
         num_sticks: int = NUM_STICKS,
         **kwargs,
     ):
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.num_sticks = num_sticks
-        # 用于在 step 中追踪哪些棒子已被移除
-        self._removed_mask: Optional[torch.Tensor] = None
-        # 保存漏斗 actor 引用, 方便沉降后禁用
-        self._funnel_walls: List[Any] = []
-        self._funnel_disabled: bool = False
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
-        # 初始化完成后，强制将动作空间覆盖为我们的离散宏动作空间
-        self.single_action_space = spaces.Discrete(self.num_sticks)
-        if self.num_envs == 1:
-            self.action_space = self.single_action_space
-        else:
-            self.action_space = spaces.MultiDiscrete([self.num_sticks] * self.num_envs)
-    # =====================================================================
-    # 1. Sim Config — 防爆调优
-    # =====================================================================
+    # ─────────────────────────────────────────────────────
+    #  仿真配置: 高频 + 高迭代 + 防爆
+    # ─────────────────────────────────────────────────────
     @property
     def _default_sim_config(self):
-        """
-        高 sim_freq + 高 solver 迭代 = 碰撞稳定性好 (防止穿模爆炸).
-        bounce_threshold 拉高 → 小速度碰撞不触发反弹.
-        enable_enhanced_determinism → 复现实验.
-        """
         return SimConfig(
-            sim_freq=1000,             # 1 kHz 物理步进 (比默认 500Hz 更稳)
-            control_freq=20,
+            sim_freq=500,          # 500 Hz 物理仿真频率 (防穿模)
+            control_freq=20,       # 20 Hz 控制频率
             scene_config=SceneConfig(
-                solver_position_iterations=150,
-                solver_velocity_iterations=150,
-                bounce_threshold=4.0,  # 提高阈值, 减少抖动/反弹
-                enable_enhanced_determinism=True,
+                solver_position_iterations=100,   # 高位置求解迭代
+                solver_velocity_iterations=100,   # 高速度求解迭代
+                bounce_threshold=2.0,
+                enable_enhanced_determinism=True,  # 增强确定性
             ),
         )
 
-    # =====================================================================
-    # 2. 相机配置 (基础观测 + 俯视)
-    # =====================================================================
+    # ─────────────────────────────────────────────────────
+    #  相机配置
+    # ─────────────────────────────────────────────────────
     @property
     def _default_sensor_configs(self):
-        # 俯视相机 (桌面正上方, 看堆)
-        top_pose = sapien_utils.look_at(eye=[0.0, 0.0, 0.55], target=[0.0, 0.0, 0.05])
-        # 斜视相机 (用于 RL obs)
-        side_pose = sapien_utils.look_at(eye=[0.35, 0.0, 0.45], target=[0.0, 0.0, 0.08])
-        return [
-            CameraConfig("base_camera", side_pose, 128, 128, np.pi / 2, 0.01, 100),
-            CameraConfig("top_camera", top_pose, 128, 128, np.pi / 2, 0.01, 100),
-        ]
+        pose = sapien_utils.look_at(
+            eye=[0.3, 0, 0.5], target=[0.0, 0.0, 0.1]
+        )
+        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
 
     @property
     def _default_human_render_camera_configs(self):
-        pose = sapien_utils.look_at(eye=[0.6, 0.6, 0.5], target=[0.0, 0.0, 0.08])
-        return CameraConfig("render_camera", pose, 1024, 1024, 1.0, 0.01, 100)
+        pose = sapien_utils.look_at(
+            eye=[0.6, 0.5, 0.5], target=[0.0, 0.0, 0.15]
+        )
+        return CameraConfig("render_camera", pose, 512, 512, 1, 0.01, 100)
 
-    # =====================================================================
-    # 3. 机械臂加载
-    # =====================================================================
+    # ─────────────────────────────────────────────────────
+    #  动作空间: 离散 Discrete(N)
+    # ─────────────────────────────────────────────────────
+    @property
+    def action_space(self):
+        """离散动作空间: 选择要挑起的棒子编号 [0, N)"""
+        return gym.spaces.Discrete(self.num_sticks)
+
+    @action_space.setter
+    def action_space(self, value):
+        """允许 BaseEnv 在初始化时设置 action_space (兼容父类)"""
+        # 我们覆盖了 getter，所以 setter 只做占位，不实际存储
+        pass
+
+    @property
+    def single_action_space(self):
+        return gym.spaces.Discrete(self.num_sticks)
+
+    @single_action_space.setter
+    def single_action_space(self, value):
+        pass
+
+    # ─────────────────────────────────────────────────────
+    #  加载机器人
+    # ─────────────────────────────────────────────────────
     def _load_agent(self, options: dict):
-        # 机械臂向 -x 方向退一步, 给桌面中心区域留出操作空间
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
 
-    # =====================================================================
-    # 4. 场景构建 — 桌子 + 漏斗 + 棒子
-    # =====================================================================
+    # ─────────────────────────────────────────────────────
+    #  加载场景: 桌子 + 棒子 + 不可见漏斗
+    # ─────────────────────────────────────────────────────
     def _load_scene(self, options: dict):
-        # ── 4.1 桌面场景 ──
+        # ── 1. 桌面场景 ──
         self.table_scene = TableSceneBuilder(
             self, robot_init_qpos_noise=self.robot_init_qpos_noise
         )
         self.table_scene.build()
 
-        # ── 4.2 构建不可见漏斗 (Invisible Funnel) ──
-        # 由 4 块倾斜静态 Box 围成倒锥, 引导棒子聚拢到桌面中心.
-        # 这些 Box 只有碰撞体, 无可见材质 (alpha=0), 沉降后会被禁用碰撞.
-        self._build_invisible_funnel()
-
-        # ── 4.3 棒子物理材质: 零恢复系数 + 高摩擦 ──
-        stick_mat = sapien.pysapien.physx.PhysxMaterial(
+        # ── 2. 棒子物理材质 (restitution=0, 防弹跳) ──
+        self.stick_phys_mat = sapien.pysapien.physx.PhysxMaterial(
             static_friction=0.8,
             dynamic_friction=0.6,
-            restitution=0.0,   # 关键: 零反弹, 抑制爆炸
+            restitution=0.0,  # 恢复系数严格为 0
         )
 
-        # ── 4.4 逐根构建棒子 ──
-        self.sticks = []
+        # ── 3. 创建 N 根棒子 ──
         rng = np.random.default_rng(42)
+        self.sticks: List[sapien.Entity] = []
 
         for i in range(self.num_sticks):
+            color = STICK_COLORS[i % len(STICK_COLORS)]
             builder = self.scene.create_actor_builder()
 
-            # # 碰撞体: 细长 Box 近似圆柱 (Box 接触更稳定, capsule 在密堆下易穿模)
-            # builder.add_box_collision(
-            #     half_size=STICK_HALF,
-            #     material=stick_mat,
-            #     density=STICK_DENSITY,
-            # )
-
-            # 可视材质
-            color = STICK_COLORS[i % len(STICK_COLORS)]
-            render_mat = sapien.render.RenderMaterial(
-                base_color=color, roughness=0.7, specular=0.1, metallic=0.0
+            # 碰撞体
+            builder.add_cylinder_collision(
+                radius=STICK_RADIUS,
+                half_length=STICK_HALF_LENGTH,
+                material=self.stick_phys_mat,
+                density=STICK_DENSITY,
             )
-            # builder.add_box_visual(half_size=STICK_HALF, material=render_mat)
-
-            builder.add_capsule_collision(
-                radius=STICK_RADIUS, 
-                half_length=STICK_LENGTH / 2, 
-                material=stick_mat, 
-                density=STICK_DENSITY
-            )
-            builder.add_capsule_visual(
-                radius=STICK_RADIUS, 
-                half_length=STICK_LENGTH / 2, 
-                material=render_mat
+            # 视觉体
+            builder.add_cylinder_visual(
+                radius=STICK_RADIUS,
+                half_length=STICK_HALF_LENGTH,
+                material=sapien.render.RenderMaterial(base_color=color),
             )
 
-            # 初始错层位姿: 在漏斗上方螺旋分布, 避免初始穿模
-            # (实际沉降位姿由 _initialize_episode 设置)
-            spawn_z = FUNNEL_TOP_Z + 0.15 + i * (STICK_RADIUS * 2.5)
-            angle = i * (2 * np.pi / self.num_sticks)
-            spawn_xy = [
-                0.04 * np.cos(angle) + FUNNEL_CENTER_XY[0],
-                0.04 * np.sin(angle) + FUNNEL_CENTER_XY[1],
-            ]
-            builder.initial_pose = sapien.Pose(p=[spawn_xy[0], spawn_xy[1], spawn_z])
+            # 初始姿态: 在漏斗上方错层生成 (避免初始穿模)
+            # Z 方向每根棒子间隔 3cm，从 0.25m 开始
+            init_z = 0.25 + i * 0.03
+            builder.initial_pose = sapien.Pose(p=[0.0, 0.0, init_z])
 
             stick = builder.build(name=f"stick_{i}")
-
-            # 通过 set_damping 增加阻尼, 使掉落后能迅速静止 (防爆关键)
-            # ManiSkill / SAPIEN: 可通过 physx body 的 linear/angular damping 设置
-            try:
-                for body in stick._bodies:
-                    body.set_linear_damping(0.5)
-                    body.set_angular_damping(0.5)
-            except Exception:
-                # 某些后端接口不支持, 忽略即可; 恢复系数=0 已足够防爆
-                pass
-
             self.sticks.append(stick)
 
-    def _build_invisible_funnel(self):
-        """
-        构建 4 块倾斜静态 Box 形成的倒锥形漏斗.
-        每块 Box 的姿态: 绕 X 或 Y 轴倾斜, 使内表面形成 45° 斜面.
-        """
-        # 漏斗斜面: 从 (±TOP_HALF, TOP_Z) 倾斜到 (±BOTTOM_HALF, BOTTOM_Z)
-        wall_length = 0.4            # 每块壁的长度
-        wall_thickness = 0.01        # 壁厚
-        # 斜面高度 & 水平跨度
-        dz = FUNNEL_TOP_Z - FUNNEL_BOTTOM_Z
-        dx = FUNNEL_TOP_HALF - FUNNEL_BOTTOM_HALF
-        slant_length = float(np.sqrt(dz * dz + dx * dx))
-        tilt_angle = float(np.arctan2(dx, dz))   # 与 Z 轴夹角
+        # ── 4. 构建不可见漏斗 (4 个倾斜的静态 Box 围成倒锥形) ──
+        # 漏斗中心在桌面上方 (0, 0, 0)
+        # 每面墙: 从 (top_half_width, funnel_height) 倾斜到 (bottom_half_width, 0)
+        self.funnel_walls: List[sapien.Entity] = []
+        self._build_funnel()
 
-        # 4 个方向: +x, -x, +y, -y
-        # 每块墙的朝向 = 绕 Y 轴 (+/- tilt_angle) 或绕 X 轴 (+/- tilt_angle)
-        walls_cfg = [
-            # 方向法向量 (指向漏斗内部), 倾斜轴, 倾斜角符号
-            ("+x", "y",  -1),
-            ("-x", "y",  +1),
-            ("+y", "x",  +1),
-            ("-y", "x",  -1),
+    def _build_funnel(self):
+        """
+        构建不可见漏斗: 4 个倾斜的静态 Box 碰撞体围成倒锥形。
+        漏斗仅有碰撞体，无视觉体 (不可见)。
+        """
+        funnel_mat = sapien.pysapien.physx.PhysxMaterial(
+            static_friction=0.3,
+            dynamic_friction=0.2,
+            restitution=0.0,
+        )
+
+        # 漏斗壁的几何参数
+        wall_length = np.sqrt(
+            (FUNNEL_TOP_HALF_WIDTH - FUNNEL_BOTTOM_HALF_WIDTH) ** 2
+            + FUNNEL_HEIGHT ** 2
+        )
+        tilt_angle = np.arctan2(
+            FUNNEL_TOP_HALF_WIDTH - FUNNEL_BOTTOM_HALF_WIDTH,
+            FUNNEL_HEIGHT,
+        )
+
+        # 壁的中心高度和水平偏移
+        mid_z = FUNNEL_HEIGHT / 2
+        mid_offset = (FUNNEL_TOP_HALF_WIDTH + FUNNEL_BOTTOM_HALF_WIDTH) / 2
+
+        # 壁的半尺寸: 长方向 = wall_length/2, 宽方向 = 漏斗沿轴向的半长度, 厚度
+        wall_half_h = wall_length / 2
+        wall_half_w = STICK_HALF_LENGTH + 0.03  # 比棒子长一些，确保兜住
+        wall_half_t = FUNNEL_HALF_THICKNESS
+
+        # 4 面墙的配置: (位置偏移方向, 旋转轴, 旋转角度)
+        # +X 面, -X 面, +Y 面, -Y 面
+        configs = [
+            # (position_offset, quaternion)
+            # +X wall: 沿 X 正方向偏移, 绕 Y 轴倾斜
+            ([mid_offset, 0, mid_z],
+             self._quat_from_axis_angle([0, 1, 0], -tilt_angle)),
+            # -X wall: 沿 X 负方向偏移, 绕 Y 轴反向倾斜
+            ([-mid_offset, 0, mid_z],
+             self._quat_from_axis_angle([0, 1, 0], tilt_angle)),
+            # +Y wall: 沿 Y 正方向偏移, 绕 X 轴倾斜
+            ([0, mid_offset, mid_z],
+             self._quat_from_axis_angle([1, 0, 0], tilt_angle)),
+            # -Y wall: 沿 Y 负方向偏移, 绕 X 轴反向倾斜
+            ([0, -mid_offset, mid_z],
+             self._quat_from_axis_angle([1, 0, 0], -tilt_angle)),
         ]
 
-        mid_x = (FUNNEL_TOP_HALF + FUNNEL_BOTTOM_HALF) / 2
-        mid_z = (FUNNEL_TOP_Z + FUNNEL_BOTTOM_Z) / 2
-
-        for direction, axis, sign in walls_cfg:
+        for idx, (pos, quat) in enumerate(configs):
             builder = self.scene.create_actor_builder()
 
-            # 半尺寸: [薄厚, 壁长/2, 斜面长度/2]
-            half = [wall_thickness / 2, wall_length / 2, slant_length / 2]
-            # 静态 (kinematic) 以避免被撞飞
-            funnel_mat = sapien.pysapien.physx.PhysxMaterial(
-                static_friction=0.3, dynamic_friction=0.2, restitution=0.0
+            # 根据墙面朝向选择合适的 half_size
+            if idx < 2:
+                # +X / -X 墙: 厚度沿 X, 宽度沿 Y, 高度沿 Z
+                half_size = [wall_half_t, wall_half_w, wall_half_h]
+            else:
+                # +Y / -Y 墙: 宽度沿 X, 厚度沿 Y, 高度沿 Z
+                half_size = [wall_half_w, wall_half_t, wall_half_h]
+
+            builder.add_box_collision(
+                half_size=half_size,
+                material=funnel_mat,
             )
-            builder.add_box_collision(half_size=half, material=funnel_mat)
+            # 不添加视觉体 → 漏斗不可见
 
-            # 位置 & 姿态
-            if direction == "+x":
-                pos = [FUNNEL_CENTER_XY[0] + mid_x, FUNNEL_CENTER_XY[1], mid_z]
-                # 绕 Y 轴旋转 (sign * tilt_angle), 使斜面朝向中心
-                half_a = sign * tilt_angle / 2
-                q = [np.cos(half_a), 0.0, np.sin(half_a), 0.0]
-            elif direction == "-x":
-                pos = [FUNNEL_CENTER_XY[0] - mid_x, FUNNEL_CENTER_XY[1], mid_z]
-                half_a = sign * tilt_angle / 2
-                q = [np.cos(half_a), 0.0, np.sin(half_a), 0.0]
-            elif direction == "+y":
-                pos = [FUNNEL_CENTER_XY[0], FUNNEL_CENTER_XY[1] + mid_x, mid_z]
-                half_a = sign * tilt_angle / 2
-                q = [np.cos(half_a), np.sin(half_a), 0.0, 0.0]
-            else:  # "-y"
-                pos = [FUNNEL_CENTER_XY[0], FUNNEL_CENTER_XY[1] - mid_x, mid_z]
-                half_a = sign * tilt_angle / 2
-                q = [np.cos(half_a), np.sin(half_a), 0.0, 0.0]
+            builder.initial_pose = sapien.Pose(p=pos, q=quat)
+            wall = builder.build_static(name=f"funnel_wall_{idx}")
+            self.funnel_walls.append(wall)
 
-            builder.initial_pose = sapien.Pose(p=pos, q=q)
-            wall = builder.build_kinematic(name=f"funnel_{direction}")
-            self._funnel_walls.append(wall)
+    @staticmethod
+    def _quat_from_axis_angle(axis: list, angle: float) -> list:
+        """轴角 → 四元数 (wxyz 格式, SAPIEN 约定)"""
+        axis = np.array(axis, dtype=float)
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        half = angle / 2.0
+        w = np.cos(half)
+        xyz = axis * np.sin(half)
+        return [w, xyz[0], xyz[1], xyz[2]]
 
-    def _disable_funnel(self):
-        """
-        沉降完成后, 禁用漏斗碰撞体 / 移出场景, 避免阻碍机械臂.
-        策略: 把漏斗 kinematic actor 瞬移到远处 (因为 ManiSkill 中动态删除 actor 较复杂).
-        """
-        if self._funnel_disabled:
-            return
-        far_pose_tensor = torch.tensor([[0.0, 0.0, -10.0]], device=self.device).expand(self.num_envs, -1)
-        far_pose = Pose.create_from_pq(far_pose_tensor)
-        for wall in self._funnel_walls:
-            try:
-                wall.set_pose(far_pose)
-            except Exception as e:
-                print(f"警告: 漏斗隐藏失败 {e}")
-                pass
-        self._funnel_disabled = True
-
-    # =====================================================================
-    # 5. Episode 初始化: 棒子撒落 + 沉降 + 移除漏斗
-    # =====================================================================
+    # ─────────────────────────────────────────────────────
+    #  Episode 初始化: 随机撒棒 + 物理沉降 + 移除漏斗
+    # ─────────────────────────────────────────────────────
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
 
-            # 漏斗复位 (Episode 之间重置)
-            self._funnel_disabled = False
-            self._funnel_reset()
-
-            # 重置"已移除"掩码
-            self._removed_mask = torch.zeros(
+            # ── 初始化移除状态掩码 (False = 未移除) ──
+            self.removed_mask = torch.zeros(
                 (b, self.num_sticks), dtype=torch.bool, device=self.device
             )
+            # 记录成功挑起的棒子数
+            self.num_removed = torch.zeros(b, dtype=torch.long, device=self.device)
 
-            # ── 5.1 在漏斗上方错层随机撒落棒子 ──
-            # 错层高度 + 随机 yaw + 随机 xy 微扰, 避免生成时穿模
-            rng = np.random.default_rng(options.get("seed", 0) if options else 0)
-
+            # ── 随机生成棒子初始姿态 ──
+            # 棒子在漏斗上方错层生成，带随机 XY 偏移和随机旋转
             for i in range(self.num_sticks):
-                # 高度错层, 避免同一高度生成两根棒子
-                layer = i
-                z = FUNNEL_TOP_Z + 0.08 + layer * (STICK_RADIUS * 2.5 + 0.01)
+                xyz = torch.zeros((b, 3))
+                # XY 随机偏移 ±3cm (在漏斗口范围内)
+                xyz[:, :2] = (torch.rand((b, 2)) - 0.5) * 0.06
+                # Z 方向错层: 从 0.20m 开始，每根间隔 2.5cm
+                xyz[:, 2] = 0.20 + i * 0.025
 
-                # XY 在漏斗上沿范围内随机
-                r = float(rng.uniform(0.0, FUNNEL_TOP_HALF * 0.6))
-                phi = float(rng.uniform(0.0, 2 * np.pi))
-                x = FUNNEL_CENTER_XY[0] + r * np.cos(phi)
-                y = FUNNEL_CENTER_XY[1] + r * np.sin(phi)
+                # 随机旋转: 随机 roll + pitch + yaw
+                # 生成随机四元数 (简化: 仅随机绕 Z 轴旋转 + 小幅 XY 倾斜)
+                yaw = torch.rand(b) * 2 * np.pi  # 绕 Z 轴 [0, 2π)
+                pitch = (torch.rand(b) - 0.5) * 0.6  # 绕 Y 轴 ±0.3 rad
+                roll = (torch.rand(b) - 0.5) * 0.6   # 绕 X 轴 ±0.3 rad
 
-                # 随机水平朝向 yaw
-                yaw = float(rng.uniform(0.0, 2 * np.pi))
-                half_y = yaw / 2
-                # 加一点微小的 pitch/roll, 使棒子掉落时旋转
-                pitch = float(rng.uniform(-0.15, 0.15))
-                roll = float(rng.uniform(-0.15, 0.15))
+                # 简化四元数: 先 yaw 再小幅 pitch/roll
+                # q = qz * qy * qx (ZYX 欧拉角)
+                qs = self._euler_to_quat_batch(roll, pitch, yaw)
 
-                # 欧拉角 → 四元数 (z-y-x 顺序)
-                cy, sy = np.cos(half_y), np.sin(half_y)
-                cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
-                cr, sr = np.cos(roll / 2), np.sin(roll / 2)
-                qw = cr * cp * cy + sr * sp * sy
-                qx = sr * cp * cy - cr * sp * sy
-                qy = cr * sp * cy + sr * cp * sy
-                qz = cr * cp * sy - sr * sp * cy
-                q = torch.tensor([[qw, qx, qy, qz]], device=self.device).expand(b, -1)
+                self.sticks[i].set_pose(Pose.create_from_pq(xyz, qs))
+                # 清零速度
+                self.sticks[i].set_linear_velocity(torch.zeros(b, 3))
+                self.sticks[i].set_angular_velocity(torch.zeros(b, 3))
 
-                xyz = torch.tensor([[x, y, z]], device=self.device).expand(b, -1)
-                self.sticks[i].set_pose(Pose.create_from_pq(xyz, q))
-                # 重置速度 (防止残留动量)
-                zero3 = torch.zeros(b, 3, device=self.device)
-                self.sticks[i].set_linear_velocity(zero3)
-                self.sticks[i].set_angular_velocity(zero3)
+            # ── 设置棒子阻尼 (使其快速静止) ──
+            for stick in self.sticks:
+                stick.set_linear_damping(5.0)   # 较大线性阻尼
+                stick.set_angular_damping(5.0)  # 较大角阻尼
 
-            # ── 5.2 物理沉降 ──
-            # 空跑 SETTLING_STEPS 步, 让棒子在漏斗引导下落到桌面并静止
-            for _ in range(SETTLING_STEPS):
+            # ── 恢复漏斗碰撞 (确保沉降时漏斗生效) ──
+            self._enable_funnel_collision(True)
+
+            # ── 物理沉降: 空跑多步让棒子受重力自然堆叠 ──
+            for _ in range(SETTLE_STEPS):
                 self.scene.step()
 
-            # ── 5.3 沉降完成, 移除漏斗 (关键步骤!) ──
-            self._disable_funnel()
+            # ── 沉降完成后移除漏斗碰撞 (不阻碍后续抓取) ──
+            self._enable_funnel_collision(False)
 
-    def _funnel_reset(self):
-        """Episode 重置时把漏斗移回原位 (若上一个 episode 已被禁用)."""
-        if not hasattr(self, "_funnel_init_poses"):
-            # 第一次调用, 记录初始位姿
-            self._funnel_init_poses = [w.pose for w in self._funnel_walls]
-            return
-        for wall, init_pose in zip(self._funnel_walls, self._funnel_init_poses):
-            try:
-                wall.set_pose(init_pose)
-            except Exception:
-                pass
-
-    # =====================================================================
-    # 6. 启发式抓取 (占位): 接收 stick_id, 执行底层轨迹
-    # =====================================================================
-    def _execute_heuristic_grasp(self, stick_id: int) -> Dict[str, Any]:
+    def _enable_funnel_collision(self, enable: bool):
         """
-        启发式抓取占位方法 — 由环境内部调用底层仿真步进完成抓取闭环.
+        启用/禁用漏斗碰撞体。
 
-        TODO: 完整实现需要
-            1. 读取目标棒子的当前 pose (position + yaw)
-            2. 规划抓取姿态: gripper 朝向棒子中点, 垂直于棒子长轴
-            3. 分阶段运动: approach → descend → close gripper → lift → retreat
-            4. 每阶段调用 N 步底层仿真 (self.scene.step() + self.agent.controller.set_action(...))
-            5. 检查: (a) 目标棒子是否被举起 (z > threshold)
-                     (b) 其他棒子是否被扰动 (位移 > PERTURB_THRESHOLD)
-
-        当前占位: 简单瞬移 (teleport) 目标棒子到"回收区" + 记录成功.
+        对于静态 Actor，通过将其移到极远处来 "禁用" 碰撞，
+        或移回原位来 "启用" 碰撞。
         """
-        # ── 记录干预前所有棒子位置 (用于判定扰动) ──
-        positions_before = torch.stack([s.pose.p.clone() for s in self.sticks], dim=0)
+        if not hasattr(self, '_funnel_original_poses'):
+            # 首次调用时保存原始位姿
+            self._funnel_original_poses = []
+            for wall in self.funnel_walls:
+                self._funnel_original_poses.append(
+                    wall.pose.raw_pose.clone()
+                )
 
-        # ── 占位: 瞬移目标棒子到远处 (模拟"抓走") ──
-        far_pose = torch.tensor([[1.0, 1.0, 1.0]], device=self.device).expand(self.num_envs, -1)
-        zero3 = torch.zeros(self.num_envs, 3, device=self.device)
-        self.sticks[stick_id].set_pose(Pose.create_from_pq(far_pose))
-        self.sticks[stick_id].set_linear_velocity(zero3)
-        self.sticks[stick_id].set_angular_velocity(zero3)
+        if enable:
+            # 恢复到原始位置
+            for wall, orig_pose in zip(self.funnel_walls, self._funnel_original_poses):
+                wall.set_pose(Pose.create(orig_pose))
+        else:
+            # 移到极远处 (禁用碰撞)
+            far_away = torch.tensor([[999.0, 999.0, -999.0]], device=self.device)
+            for wall in self.funnel_walls:
+                wall.set_pose(Pose.create_from_pq(far_away))
 
-        # 空跑几步让其他棒子响应重心变化 (可能塌陷)
-        for _ in range(30):
-            self.scene.step()
+    @staticmethod
+    def _euler_to_quat_batch(
+        roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        ZYX 欧拉角 → 四元数 (wxyz), batch 版本。
 
-        # ── 判定其他棒子是否被扰动 ──
-        positions_after = torch.stack([s.pose.p.clone() for s in self.sticks], dim=0)
-        displacements = torch.norm(positions_after - positions_before, dim=-1)
-        # 排除被抓起的那根自己
-        mask = torch.ones(self.num_sticks, dtype=torch.bool, device=self.device)
-        mask[stick_id] = False
-        # 同时排除已经移除的棒子 (它们在远处, 不计入扰动)
-        if self._removed_mask is not None:
-            # removed_mask 形状 (B, N); 简单起见这里取 env 0
-            mask = mask & (~self._removed_mask[0])
+        Args:
+            roll, pitch, yaw: (B,) tensors
 
-        max_disp = displacements[mask].max().item() if mask.any() else 0.0
-        others_disturbed = max_disp > PERTURB_THRESHOLD
+        Returns:
+            q: (B, 4) wxyz 四元数
+        """
+        cr, sr = torch.cos(roll / 2), torch.sin(roll / 2)
+        cp, sp = torch.cos(pitch / 2), torch.sin(pitch / 2)
+        cy, sy = torch.cos(yaw / 2), torch.sin(yaw / 2)
 
-        # ── 标记移除 ──
-        if self._removed_mask is not None:
-            self._removed_mask[:, stick_id] = True
+        w = cr * cp * cy + sr * sp * sy
+        x = sr * cp * cy - cr * sp * sy
+        y = cr * sp * cy + sr * cp * sy
+        z = cr * cp * sy - sr * sp * cy
 
-        return {
-            "grasped_stick_id": stick_id,
-            "others_max_displacement": max_disp,
-            "others_disturbed": others_disturbed,
-            "success": not others_disturbed,
-        }
+        return torch.stack([w, x, y, z], dim=-1)
 
-    # =====================================================================
-    # 7. step 重写: 接收离散动作, 调用启发式抓取
-    # =====================================================================
+    # ─────────────────────────────────────────────────────
+    #  step: 离散宏动作
+    # ─────────────────────────────────────────────────────
     def step(self, action):
         """
-        宏动作 step:
-            action: int / np.ndarray / torch.Tensor — stick_id ∈ [0, N)
+        覆盖 BaseEnv.step() 以支持离散宏动作。
+
+        Args:
+            action: int 或 Tensor — 要挑起的棒子编号 [0, N)
+
+        Returns:
+            obs, reward, terminated, truncated, info (标准 Gym 接口)
         """
-        # 规范化 action
-        if isinstance(action, torch.Tensor):
-            stick_id = int(action.flatten()[0].item())
+        # 将 action 转为 tensor
+        if isinstance(action, (int, np.integer)):
+            action = torch.tensor([action], device=self.device, dtype=torch.long)
         elif isinstance(action, np.ndarray):
-            stick_id = int(action.flatten()[0])
+            action = torch.from_numpy(action).to(device=self.device, dtype=torch.long)
+        elif isinstance(action, torch.Tensor):
+            action = action.to(device=self.device, dtype=torch.long)
+
+        if action.dim() == 0:
+            action = action.unsqueeze(0)
+
+        # 对每个并行环境执行宏动作
+        grasp_success = self._execute_heuristic_grasp(action)
+
+        # 更新移除状态
+        for env_i in range(len(action)):
+            stick_id = action[env_i].item()
+            if grasp_success[env_i] and not self.removed_mask[env_i, stick_id]:
+                self.removed_mask[env_i, stick_id] = True
+                self.num_removed[env_i] += 1
+
+        # 步数递增
+        self._elapsed_steps += 1
+
+        # 获取 info 和 obs
+        info = self.get_info()
+        obs = self.get_obs(info, unflattened=True)
+        reward = self.get_reward(obs=obs, action=action, info=info)
+        obs = self._flatten_raw_obs(obs)
+
+        # 终止条件: 所有棒子都被移除
+        if "success" in info:
+            terminated = info["success"].clone()
         else:
-            stick_id = int(action)
+            terminated = torch.zeros(self.num_envs, dtype=bool, device=self.device)
 
-        # ── 非法动作检查 ──
-        if self._removed_mask is not None and bool(self._removed_mask[0, stick_id]):
-            # 选了一根已经被移除的棒子 → 惩罚 + 不前进
-            obs = self.get_obs()
-            info = {
-                "illegal_action": True,
-                "grasped_stick_id": stick_id,
-                "others_disturbed": False,
-                "success": torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
-            }
-            reward = torch.full((self.num_envs,), -1.0, device=self.device)
-            terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            return obs, reward, terminated, truncated, info
+        truncated = torch.zeros(self.num_envs, dtype=bool, device=self.device)
 
-        # ── 执行启发式抓取 ──
-        grasp_info = self._execute_heuristic_grasp(stick_id)
-
-        # ── 获取观测 & 计算奖励 ──
-        obs = self.get_obs()
-        info = self.evaluate()
-        info.update(grasp_info)
-
-        reward = self.compute_dense_reward(obs=obs, action=action, info=info)
-
-        # ── 终止条件 ──
-        # (a) 全部取走 → success
-        # (b) 任意一步扰动其他棒子 → terminate (失败)
-        all_removed = self._removed_mask.all(dim=-1) if self._removed_mask is not None else \
-                      torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        disturbed = torch.tensor(
-            [grasp_info["others_disturbed"]] * self.num_envs,
-            dtype=torch.bool, device=self.device,
-        )
-        terminated = all_removed | disturbed
-        truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-
-        info["success"] = all_removed & (~disturbed)
+        self._last_obs = obs
         return obs, reward, terminated, truncated, info
 
-    # =====================================================================
-    # 8. 观测: Privileged State (所有棒子的 6DoF)
-    # =====================================================================
+    # ─────────────────────────────────────────────────────
+    #  启发式抓取 (宏动作占位)
+    # ─────────────────────────────────────────────────────
+    def _execute_heuristic_grasp(self, stick_ids: torch.Tensor) -> torch.Tensor:
+        """
+        启发式宏动作: 尝试挑起指定编号的棒子。
+
+        当前为占位实现 — 简化逻辑:
+        1. 检查目标棒子是否已被移除 → 若已移除则失败
+        2. 检查目标棒子上方是否有其他棒子压着 (通过高度判断) → 若被压则失败
+        3. 若可挑取，将棒子移到远处 (模拟移除)，并空跑若干步让剩余棒子重新沉降
+
+        TODO: 替换为真正的运动规划 + 力控抓取闭环:
+            - IK 求解 TCP → 棒子抓取点
+            - 闭合夹爪 + 力反馈判断是否夹稳
+            - 提升 + 放置到收集区
+            - 多步底层 scene.step() 完成整个抓取流程
+
+        Args:
+            stick_ids: (B,) 每个并行环境要挑起的棒子编号
+
+        Returns:
+            success: (B,) bool tensor — 每个环境是否成功挑起
+        """
+        b = len(stick_ids)
+        success = torch.zeros(b, dtype=torch.bool, device=self.device)
+
+        for env_i in range(b):
+            sid = stick_ids[env_i].item()
+
+            # 检查: 棒子是否已被移除
+            if self.removed_mask[env_i, sid]:
+                continue
+
+            # 检查: 棒子是否是 "自由" 的 (上方没有其他棒子压着)
+            # 简化判断: 比较目标棒子高度与其他未移除棒子的高度
+            target_z = self.sticks[sid].pose.p[env_i, 2].item()
+            is_free = True
+
+            for j in range(self.num_sticks):
+                if j == sid or self.removed_mask[env_i, j]:
+                    continue
+                other_z = self.sticks[j].pose.p[env_i, 2].item()
+                # 如果有其他棒子在目标棒子正上方且距离很近
+                other_xy = self.sticks[j].pose.p[env_i, :2]
+                target_xy = self.sticks[sid].pose.p[env_i, :2]
+                xy_dist = torch.norm(other_xy - target_xy).item()
+
+                if other_z > target_z + STICK_RADIUS and xy_dist < STICK_HALF_LENGTH:
+                    # 有棒子在上方且水平距离较近 → 可能被压着
+                    # 这里用简化的启发式，实际应使用接触力判断
+                    is_free = False
+                    break
+
+            if not is_free:
+                continue
+
+            # 挑取成功: 将棒子移到远处
+            far_pos = torch.tensor(
+                [[999.0, 999.0, 999.0]], device=self.device
+            )
+            self.sticks[sid].set_pose(Pose.create_from_pq(far_pos))
+            self.sticks[sid].set_linear_velocity(torch.zeros(1, 3, device=self.device))
+            self.sticks[sid].set_angular_velocity(torch.zeros(1, 3, device=self.device))
+
+            success[env_i] = True
+
+        # 移除后让剩余棒子重新沉降 (短暂物理步进)
+        if success.any():
+            for _ in range(50):
+                self.scene.step()
+
+        return success
+
+    # ─────────────────────────────────────────────────────
+    #  评估: 成功条件
+    # ─────────────────────────────────────────────────────
+    def evaluate(self):
+        # 所有棒子都被移除 → 成功
+        all_removed = self.removed_mask.all(dim=1)
+        return {
+            "success": all_removed,
+            "num_removed": self.num_removed,
+            "removed_mask": self.removed_mask,
+        }
+
+    # ─────────────────────────────────────────────────────
+    #  观测: Privileged State
+    # ─────────────────────────────────────────────────────
     def _get_obs_extra(self, info: Dict):
-        """
-        特权观测: 每根棒子的位姿 (7 维: pos + quat) + removed 标志.
-        共计 N * (7 + 1) = N * 8 维.
-        """
-        obs = dict(tcp_pose=self.agent.tcp.pose.raw_pose)
+        obs = dict(
+            tcp_pose=self.agent.tcp.pose.raw_pose,
+            removed_mask=self.removed_mask.float(),
+            num_removed=self.num_removed.float().unsqueeze(-1),
+        )
         if "state" in self.obs_mode:
+            # Privileged state: 所有棒子的 6DoF 姿态 (7D raw_pose × N)
             stick_poses = torch.stack(
                 [s.pose.raw_pose for s in self.sticks], dim=1
             )  # (B, N, 7)
-            removed = (
-                self._removed_mask.float()
-                if self._removed_mask is not None
-                else torch.zeros(self.num_envs, self.num_sticks, device=self.device)
-            )
-            obs["stick_poses"] = stick_poses.flatten(start_dim=1)       # (B, N*7)
-            obs["stick_removed"] = removed                              # (B, N)
+            obs["stick_poses"] = stick_poses.flatten(start_dim=1)  # (B, N*7)
         return obs
 
-    # =====================================================================
-    # 9. Dependency Graph (辅助函数框架 — 哪根棒子压在哪根上面)
-    # =====================================================================
-    def compute_dependency_graph(self, force_threshold_ratio: float = 0.1) -> np.ndarray:
-        """
-        通过 SAPIEN 接触力求解 "i 压在 j 上面" 的有向图 (adjacency matrix).
-        参考 jenga_tower.py::get_support_graph 的设计.
-
-        Returns:
-            dep: np.ndarray (N, N), dep[i, j] = 1 表示 stick_i 压在 stick_j 上 (即 j 支撑 i).
-        """
-        n = self.num_sticks
-        dt = self.scene.timestep
-
-        # entity → index 映射
-        entity_to_idx = {s._bodies[0].entity: i for i, s in enumerate(self.sticks)}
-
-        # 单根棒子重力阈值
-        vol = STICK_LENGTH * (2 * STICK_RADIUS) ** 2
-        threshold = force_threshold_ratio * vol * STICK_DENSITY * 9.81
-
-        dep = np.zeros((n, n), dtype=int)
-        for contact in self.scene.get_contacts():
-            e0, e1 = contact.bodies[0].entity, contact.bodies[1].entity
-            if e0 not in entity_to_idx or e1 not in entity_to_idx:
-                continue
-            idx0, idx1 = entity_to_idx[e0], entity_to_idx[e1]
-            fz = sum(pt.impulse[2] for pt in contact.points) / dt
-
-            # fz > 0: body1 → body0 的冲量 +Z, 即 body1 对 body0 向上推力
-            # ∴ body0 压在 body1 上 (body1 在下支撑 body0)
-            if fz > threshold:
-                dep[idx0, idx1] = 1
-            if -fz > threshold:
-                dep[idx1, idx0] = 1
-
-        return dep
-
-    # =====================================================================
-    # 10. 评估 & 奖励
-    # =====================================================================
-    def evaluate(self) -> Dict[str, torch.Tensor]:
-        if self._removed_mask is None:
-            success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            n_removed = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        else:
-            success = self._removed_mask.all(dim=-1)
-            n_removed = self._removed_mask.sum(dim=-1).to(torch.int32)
-        return {
-            "success": success,
-            "num_removed": n_removed,
-        }
-
+    # ─────────────────────────────────────────────────────
+    #  奖励: 模板 (Dense / Normalized)
+    # ─────────────────────────────────────────────────────
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
         """
-        奖励设计 (参考 Jenga Tower 的密集奖励结构):
-            + 基础奖励: 每成功挑起一根棒子 +1.0
-            - 扰动惩罚: 若其他棒子位移超过阈值 -2.0
-            + 完成奖励: 全部取走 +5.0
+        模板奖励函数。
+
+        当前设计:
+        - 每成功挑起一根棒子: +1.0
+        - 挑取失败 (被压住或已移除): -0.1
+        - 全部挑完 bonus: +5.0
         """
         reward = torch.zeros(self.num_envs, device=self.device)
 
-        # 成功抓起 (未扰动) → +1
-        if info.get("others_disturbed", False) is False and not info.get("illegal_action", False):
-            reward += 1.0
+        # 基于 num_removed 的增量奖励
+        # (这里简化为: 当前 num_removed / total 作为进度奖励)
+        progress = self.num_removed.float() / self.num_sticks
+        reward += progress
 
-        # 扰动惩罚
-        if info.get("others_disturbed", False):
-            reward -= 2.0
-
-        # 全部完成 → +5 (one-shot)
+        # 成功 bonus
         if "success" in info:
-            success = info["success"]
-            if isinstance(success, torch.Tensor):
-                reward = torch.where(success, reward + 5.0, reward)
-            elif success:
-                reward += 5.0
+            reward[info["success"]] = 5.0
 
         return reward
 
-    def compute_normalized_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
-        # 理论最大单步奖励 = 1 (抓起) + 5 (完成) = 6
-        return self.compute_dense_reward(obs=obs, action=action, info=info) / 6.0
+    def compute_normalized_dense_reward(
+        self, obs: Any, action: torch.Tensor, info: Dict
+    ):
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / 5.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  独立运行入口: 可视化验证
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#  独立运行: 可视化验证 + Dependency Graph 提取
+# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     env = gym.make(
         "PickUpSticks-v1",
@@ -627,61 +702,58 @@ if __name__ == "__main__":
     )
 
     obs, _ = env.reset(seed=42)
+    print(f"观测维度: {env.observation_space}")
+    print(f"动作空间: {env.action_space}")
+    print(f"棒子数量: {NUM_STICKS}")
+
+    # 预热: 零动作步进, 让接触力稳定
+    for _ in range(5):
+        env.step(0)
+
+    # ─── 提取 Dependency Graph ───
     uw = env.unwrapped
+    graph = get_dependency_graph(uw.scene, uw.sticks)
 
-    print(f"\n{'='*60}")
-    print(f"  PickUpSticks-v1 环境初始化完成")
-    print(f"{'='*60}")
-    print(f"  棒子数量 N = {uw.num_sticks}")
-    print(f"  动作空间  = {env.action_space}")
-    print(f"  观测空间  = {env.observation_space}")
-    print(f"  沉降步数  = {SETTLING_STEPS}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*50}")
+    print(f"  Dependency Graph  (threshold = 5% stick weight)")
+    print(f"{'='*50}")
+    print(f"  高度范围: [{min(graph['heights']):.4f}, {max(graph['heights']):.4f}] m")
 
-    # ── 提取 Dependency Graph ──
-    dep = uw.compute_dependency_graph()
-    edges = int(dep.sum())
-    print(f"  Dependency Graph: {edges} 条 '压在上面' 的边")
-    for i in range(uw.num_sticks):
-        for j in range(uw.num_sticks):
-            if dep[i, j]:
-                print(f"    stick_{i:2d}  压在  stick_{j:2d}  上面")
+    print(f"\n  依赖边 (i → j 表示 stick_i 支撑 stick_j):")
+    edge_count = 0
+    for i, row in enumerate(graph["dependency_matrix"]):
+        for j, v in enumerate(row):
+            if v:
+                print(f"    stick_{i} → stick_{j}")
+                edge_count += 1
+    print(f"  共 {edge_count} 条依赖边\n")
+
+    # ─── 计算移除难度 ───
+    difficulty = get_removal_difficulty(
+        graph["dependency_matrix"], graph["heights"]
+    )
+    print(f"  移除难度分数:")
+    for i in range(NUM_STICKS):
+        print(f"    stick_{i}: {difficulty[i]:.4f}")
     print()
 
-    # ── 交互可视化 ──
+    # ─── 交互式可视化 ───
     viewer = env.render()
     if hasattr(viewer, "paused"):
         viewer.paused = True
 
-    print("环境已初始化。请在弹出的窗口中查看桌上的棒子！")
-    print("如果画面暂停，可以按空格键播放。关闭窗口以退出。")
-    
-    # 用死循环卡住画面，不要去执行自动抓取
     while True:
+        # 随机选择一根棒子尝试挑起
+        action = env.action_space.sample()
+        obs, reward, terminated, truncated, info = env.step(action)
+        print(f"Action: stick_{action}, Reward: {reward:.3f}, "
+              f"Removed: {uw.num_removed.item()}/{NUM_STICKS}")
         try:
             env.render()
         except (TypeError, AttributeError):
             break
-            
+        if (terminated | truncated).any():
+            print("Episode finished! Resetting...")
+            obs, _ = env.reset()
+
     env.close()
-
-    # # ── 随机顺序挑棒子 (演示宏动作接口) ──
-    # remaining = list(range(uw.num_sticks))
-    # rng = np.random.default_rng(0)
-    # rng.shuffle(remaining)
-
-    # try:
-    #     for sid in remaining:
-    #         print(f"  尝试挑起 stick_{sid} ...")
-    #         obs, reward, terminated, truncated, info = env.step(sid)
-    #         env.render()
-    #         print(f"    reward = {float(reward):.2f}  "
-    #               f"扰动 max_disp = {info.get('others_max_displacement', 0):.4f}m  "
-    #               f"disturbed = {info.get('others_disturbed', False)}")
-    #         if bool(terminated.any() if hasattr(terminated, 'any') else terminated):
-    #             print(f"\n  ⚠ Episode 终止. 成功移除: {int(info.get('num_removed', 0))}/{uw.num_sticks}")
-    #             break
-    # except KeyboardInterrupt:
-    #     pass
-    # finally:
-    #     env.close()
